@@ -14,8 +14,9 @@
   border: none;
 }
 
-/* Increase sidebar width so grid columns are easier to read */
-[data-testid="stSidebar"] {
+/* Style for custom side panel */
+.side-panel {
   width: 400px;
   min-width: 400px;
+  padding: 1rem;
 }

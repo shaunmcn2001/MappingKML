@@ -17,17 +17,20 @@ from kml_utils import (
     get_bounds,
 )
 
-# Sidebar and map layout using Streamlit's sidebar
-with st.sidebar:
+# Layout with side panel similar to kepler.gl
+side_col, map_col = st.columns([1, 3], gap="small")
+
+with side_col:
+    st.markdown('<div class="side-panel">', unsafe_allow_html=True)
     selected_tab = option_menu(
         None,
-        ["Layers", "Filters", "Interactions", "Basemap", "Query"],
-        icons=["layers", "funnel-fill", "cursor", "map", "search"],
-        default_index=4,
+        ["Layers", "Filters", "Search", "Interactions", "Basemap"],
+        icons=["layers", "funnel-fill", "search", "cursor", "map"],
+        default_index=2,
         orientation="vertical",
     )
 
-    if selected_tab == "Query":
+    if selected_tab == "Search":
         with st.expander("Search Parcels", expanded=True):
             with st.form("search_form"):
                 bulk_query = st.text_area(
@@ -232,43 +235,47 @@ with st.sidebar:
                     )
     else:
         st.info(f"{selected_tab} options go here.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-base_map = folium.Map(
-    location=[-23.5, 143.0], zoom_start=5, tiles=None, zoomControl=True
-)
-folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True).add_to(base_map)
-folium.TileLayer("CartoDB positron", name="CartoDB Positron", control=True).add_to(
-    base_map
-)
-folium.TileLayer("CartoDB dark_matter", name="CartoDB Dark", control=True).add_to(
-    base_map
-)
-folium.TileLayer(
-    tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-    attr="Google",
-    name="Google Satellite",
-    control=True,
-).add_to(base_map)
-if st.session_state.get("features") and st.session_state["features"]:
-    features = st.session_state["features"]
-    fill_color = st.session_state.get("fill_color", "#FF0000")
-    outline_color = st.session_state.get("outline_color", "#000000")
-    opacity = st.session_state.get("fill_opacity", 0.5)
-    weight = st.session_state.get("outline_weight", 2)
-    folium.GeoJson(
-        data={"type": "FeatureCollection", "features": features},
-        name="Parcels",
-        style_function=lambda feat: {
-            "fillColor": fill_color,
-            "color": outline_color,
-            "weight": weight,
-            "fillOpacity": opacity,
-        },
+with map_col:
+    base_map = folium.Map(
+        location=[-23.5, 143.0], zoom_start=5, tiles=None, zoomControl=True
+    )
+    folium.TileLayer(
+        "OpenStreetMap", name="OpenStreetMap", control=True
     ).add_to(base_map)
-    bounds = get_bounds(features)
-    base_map.fit_bounds(bounds)
-else:
-    base_map.fit_bounds([[-39, 137], [-9, 155]])
-folium.LayerControl(collapsed=False).add_to(base_map)
-map_html = base_map._repr_html_()
-st.components.v1.html(map_html, height=700, width=None, scrolling=True)
+    folium.TileLayer(
+        "CartoDB positron", name="CartoDB Positron", control=True
+    ).add_to(base_map)
+    folium.TileLayer(
+        "CartoDB dark_matter", name="CartoDB Dark", control=True
+    ).add_to(base_map)
+    folium.TileLayer(
+        tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+        attr="Google",
+        name="Google Satellite",
+        control=True,
+    ).add_to(base_map)
+    if st.session_state.get("features") and st.session_state["features"]:
+        features = st.session_state["features"]
+        fill_color = st.session_state.get("fill_color", "#FF0000")
+        outline_color = st.session_state.get("outline_color", "#000000")
+        opacity = st.session_state.get("fill_opacity", 0.5)
+        weight = st.session_state.get("outline_weight", 2)
+        folium.GeoJson(
+            data={"type": "FeatureCollection", "features": features},
+            name="Parcels",
+            style_function=lambda feat: {
+                "fillColor": fill_color,
+                "color": outline_color,
+                "weight": weight,
+                "fillOpacity": opacity,
+            },
+        ).add_to(base_map)
+        bounds = get_bounds(features)
+        base_map.fit_bounds(bounds)
+    else:
+        base_map.fit_bounds([[-39, 137], [-9, 155]])
+    folium.LayerControl(collapsed=False).add_to(base_map)
+    map_html = base_map._repr_html_()
+    st.components.v1.html(map_html, height=700, width=None, scrolling=True)
