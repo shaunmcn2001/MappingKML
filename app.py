@@ -3,9 +3,6 @@ from streamlit_option_menu import option_menu
 
 st.set_page_config(page_title="Parcel Viewer", layout="wide")
 
-with open("style.css") as css_file:
-    st.markdown(f"<style>{css_file.read()}</style>", unsafe_allow_html=True)
-
 import requests, folium, pandas as pd, re
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 from st_aggrid.shared import ColumnsAutoSizeMode

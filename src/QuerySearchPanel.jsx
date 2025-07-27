@@ -1,17 +1,37 @@
 import React, {useState} from 'react';
 
-const mockData = [
-  { id: 1, lot: 'LotA', plan: 'PlanX' },
-  { id: 2, lot: 'LotB', plan: 'PlanY' }
-];
-
 export default function QuerySearchPanel() {
   const [input, setInput] = useState('');
   const [results, setResults] = useState([]);
 
   const onSearch = async () => {
-    await new Promise(r => setTimeout(r, 500));
-    setResults(mockData);
+    const queries = input.split(/\n/).map(l => l.trim()).filter(Boolean);
+    if (queries.length === 0) return;
+    try {
+      const res = await fetch('/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ queries })
+      });
+      const data = await res.json();
+      const features = data.features || [];
+      const regions = data.regions || [];
+      const rows = features.map((f, idx) => {
+        const props = f.properties || {};
+        if (regions[idx] === 'QLD') {
+          return { id: idx + 1, lot: props.lot, plan: props.plan };
+        }
+        return {
+          id: idx + 1,
+          lot: props.lotnumber,
+          plan: props.planlabel || ''
+        };
+      });
+      setResults(rows);
+    } catch (err) {
+      console.error(err);
+      setResults([]);
+    }
   };
 
   return (
