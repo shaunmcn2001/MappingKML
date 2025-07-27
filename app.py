@@ -8,6 +8,40 @@ from streamlit_keplergl import keplergl_static
 from shapely.geometry import mapping as shp_mapping
 from fastkml import kml
 import pandas as pd
+from math import inf
+
+def compute_bbox_of_featurecollections(named_fcs: dict[str, dict]):
+    """Return (minx, miny, maxx, maxy) across all FeatureCollections; None if empty."""
+    minx, miny, maxx, maxy = inf, inf, -inf, -inf
+
+    def walk_coords(coords):
+        nonlocal minx, miny, maxx, maxy
+        if isinstance(coords, (list, tuple)) and coords and isinstance(coords[0], (int, float)):
+            x, y = coords[:2]
+            if x < minx:
+                minx = x
+            if y < miny:
+                miny = y
+            if x > maxx:
+                maxx = x
+            if y > maxy:
+                maxy = y
+        elif isinstance(coords, (list, tuple)):
+            for c in coords:
+                walk_coords(c)
+
+    for _, fc in named_fcs.items():
+        if not fc or fc.get("type") != "FeatureCollection":
+            continue
+        for feat in fc.get("features", []):
+            geom = (feat or {}).get("geometry")
+            if not geom:
+                continue
+            walk_coords(geom.get("coordinates"))
+
+    if minx is inf:
+        return None
+    return (minx, miny, maxx, maxy)
 
 from kepler_config import BASE_CONFIG
 
@@ -276,7 +310,8 @@ if q_run and lotplan.strip():
             st.sidebar.error("Your query must return a GeoJSON FeatureCollection dict.")
         else:
             st.session_state["datasets"][ds_query_name] = fc
-            st.sidebar.success(f"Added: {ds_query_name} ({len(fc.get('features', []))} features)")
+            st.success(f"Added: {ds_query_name} ({len(fc.get('features', []))} features)")
+            st.info(f"Datasets now: {', '.join(st.session_state['datasets'].keys())}")
     except Exception as e:
         st.sidebar.error(f"Query error: {e}")
 
@@ -299,10 +334,33 @@ if st.session_state["datasets"]:
 # ---------------------------
 # Kepler map render
 # ---------------------------
-# Build KeplerGl map and add each dataset as a named GeoJSON source.
-map_ = KeplerGl(height=800, config=BASE_CONFIG)
-for name, fc in st.session_state["datasets"].items():
-    # KeplerGl Python accepts GeoJSON dicts via add_data
-    map_.add_data(data=fc, name=name)
+# Build the data bundle Kepler expects: { name: FeatureCollection, ... }
+data_bundle = {name: fc for name, fc in st.session_state.get("datasets", {}).items()}
 
-keplergl_static(map_)
+# Start from BASE_CONFIG, but REMOVE explicit layers so Kepler auto-creates them.
+cfg = dict(BASE_CONFIG) if 'BASE_CONFIG' in globals() else {}
+try:
+    # Deep copy and clear layers safely
+    import copy
+    cfg = copy.deepcopy(cfg)
+    if "config" in cfg and "visState" in cfg["config"]:
+        cfg["config"]["visState"].pop("layers", None)
+except Exception:
+    pass
+
+# Optional: center map to data bbox
+bbox = compute_bbox_of_featurecollections(data_bundle) if data_bundle else None
+if bbox and "config" in cfg and "mapState" in cfg["config"]:
+    minx, miny, maxx, maxy = bbox
+    center_lon = (minx + maxx) / 2.0
+    center_lat = (miny + maxy) / 2.0
+    cfg["config"]["mapState"]["longitude"] = center_lon
+    cfg["config"]["mapState"]["latitude"] = center_lat
+    # A conservative zoom; user can adjust further
+    # (Precise fit requires custom calc; we keep it simple here)
+    cfg["config"]["mapState"]["zoom"] = cfg["config"]["mapState"].get("zoom", 9)
+
+# IMPORTANT: pass datasets via `data=` so Kepler auto-adds layers
+m = KeplerGl(height=800, data=data_bundle if data_bundle else None, config=cfg if cfg else None)
+
+keplergl_static(m)
