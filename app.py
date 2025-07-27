@@ -1,278 +1,130 @@
+import json
+from io import BytesIO
+
 import streamlit as st
-from streamlit_option_menu import option_menu
+from keplergl import KeplerGl
+from streamlit_keplergl import keplergl_static
 
-st.set_page_config(page_title="Parcel Viewer", layout="wide")
+from shapely.geometry import mapping as shp_mapping
+from fastkml import kml
+import pandas as pd
 
-import requests, folium, pandas as pd, re
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
-from st_aggrid.shared import ColumnsAutoSizeMode
+from kepler_config import BASE_CONFIG
 
-from kml_utils import (
-    _hex_to_kml_color,
-    generate_kml,
-    generate_shapefile,
-    get_bounds,
-)
+st.set_page_config(page_title="MappingKML — Kepler Layout + Query", layout="wide")
+st.markdown("<style>" + open("style.css", "r", encoding="utf-8").read() + "</style>", unsafe_allow_html=True)
 
-# Layout with side panel similar to kepler.gl
-side_col, map_col = st.columns([1, 3], gap="small")
+# ---------------------------
+# KML -> GeoJSON (FeatureCollection)
+# ---------------------------
+def kml_to_featurecollection(kml_bytes: bytes) -> dict:
+    kdoc = kml.KML()
+    kdoc.from_string(kml_bytes)
 
-with side_col:
-    st.markdown('<div class="side-panel">', unsafe_allow_html=True)
-    selected_tab = option_menu(
-        None,
-        ["Layers", "Filters", "Search", "Interactions", "Basemap"],
-        icons=["layers", "funnel-fill", "search", "cursor", "map"],
-        default_index=2,
-        orientation="vertical",
+    def collect(node):
+        geoms = []
+        if hasattr(node, "geometry") and node.geometry is not None:
+            geoms.append(node.geometry)
+        if hasattr(node, "features") and node.features() is not None:
+            for f in node.features():
+                geoms.extend(collect(f))
+        return geoms
+
+    features = []
+    # Walk all top-level features (Documents/Folders/Placemarks)
+    for f in getattr(kdoc, "features")() or []:
+        for g in collect(f):
+            try:
+                features.append({"type": "Feature", "geometry": shp_mapping(g), "properties": {}})
+            except Exception:
+                pass
+
+    # Edge case: nothing on top-level
+    if not features:
+        for g in collect(kdoc):
+            try:
+                features.append({"type": "Feature", "geometry": shp_mapping(g), "properties": {}})
+            except Exception:
+                pass
+
+    return {"type": "FeatureCollection", "features": features}
+
+# ---------------------------
+# YOUR QUERY HOOK (replace stub with your real function)
+# ---------------------------
+def run_lotplan_query(lotplan_text: str) -> dict:
+    """
+    Replace this stub with your existing query implementation.
+    It MUST return a GeoJSON FeatureCollection (polygons preferred).
+    Contract:
+      input: raw lot/plan string (e.g. '169-173, 203, 220, 246, 329//DP753311' or '1RP912949')
+      output: {"type":"FeatureCollection","features":[{"type":"Feature","geometry":{...},"properties":{...}}, ...]}
+    """
+    # TODO: integrate your ArcGIS/QLD cadastral query code here, producing a FeatureCollection.
+    return {"type": "FeatureCollection", "features": []}
+
+# ---------------------------
+# Sidebar UI (Query + KML upload + dataset management)
+# ---------------------------
+st.sidebar.title("Query & Data")
+st.sidebar.caption("Add a **Query** panel next to Kepler’s Layers/Filters to drive datasets rendered on the map.")
+
+with st.sidebar.expander("Query (Lot/Plan search)", expanded=True):
+    lotplan = st.text_area(
+        "Enter Lot/Plan (supports comma/range syntax):",
+        placeholder="e.g. 169-173, 203, 220, 246, 329//DP753311 or 1RP912949",
+        height=100,
     )
+    q_run = st.button("Run Query", type="primary", use_container_width=True)
+    st.caption("Wire your query in run_lotplan_query() to return a **GeoJSON FeatureCollection**.")
 
-    if selected_tab == "Search":
-        with st.expander("Search Parcels", expanded=True):
-            with st.form("search_form"):
-                bulk_query = st.text_area(
-                    "Parcel search (bulk):",
-                    "",
-                    help="Enter Lot/Plan (QLD) or Lot/Section/Plan (NSW) one per line.",
-                )
-                submit = st.form_submit_button("Search")
-        if submit:
-            inputs = [line.strip() for line in bulk_query.splitlines() if line.strip()]
-            all_feats = []
-            all_regions = []
-            with st.spinner("Searching..."):
-                for user_input in inputs:
-                    lot_str = sec_str = plan_str = ""
-                    if "/" in user_input:
-                        region = "NSW"
-                        parts = user_input.split("/")
-                        if len(parts) == 3:
-                            lot_str, sec_str, plan_str = (
-                                parts[0].strip(),
-                                parts[1].strip(),
-                                parts[2].strip(),
-                            )
-                        elif len(parts) == 2:
-                            lot_str, sec_str, plan_str = (
-                                parts[0].strip(),
-                                "",
-                                parts[1].strip(),
-                            )
-                        else:
-                            lot_str, sec_str, plan_str = "", "", ""
-                    if sec_str == "" and "//" in user_input:
-                        lot_str, plan_str = user_input.split("//")
-                        sec_str = ""
-                    plan_num = "".join(filter(str.isdigit, plan_str))
-                    if lot_str == "" or plan_num == "":
-                        continue
-                    where_clauses = [f"lotnumber='{lot_str}'"]
-                    if sec_str:
-                        where_clauses.append(f"sectionnumber='{sec_str}'")
-                    else:
-                        where_clauses.append(
-                            "(sectionnumber IS NULL OR sectionnumber = '')"
-                        )
-                    where_clauses.append(f"plannumber={plan_num}")
-                    where = " AND ".join(where_clauses)
-                    url = "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query"
-                    params = {
-                        "where": where,
-                        "outFields": "lotnumber,sectionnumber,planlabel",
-                        "outSR": "4326",
-                        "f": "geoJSON",
-                    }
-                    try:
-                        res = requests.get(url, params=params, timeout=10)
-                        data = res.json()
-                    except Exception as e:
-                        data = {}
-                    feats = data.get("features", []) or []
-                    for feat in feats:
-                        all_feats.append(feat)
-                        all_regions.append("NSW")
-                    region = "QLD"
-                    inp = user_input.replace(" ", "").upper()
-                    match = re.match(r"^(\d+)([A-Z].+)$", inp)
-                    if not match:
-                        continue
-                    lot_str = match.group(1)
-                    plan_str = match.group(2)
-                    url = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer/4/query"
-                    params = {
-                        "where": f"lot='{lot_str}' AND plan='{plan_str}'",
-                        "outFields": "lot,plan,lotplan,locality",
-                        "outSR": "4326",
-                        "f": "geoJSON",
-                    }
-                    try:
-                        res = requests.get(url, params=params, timeout=10)
-                        data = res.json()
-                    except Exception as e:
-                        data = {}
-                    feats = data.get("features", []) or []
-                    for feat in feats:
-                        all_feats.append(feat)
-                        all_regions.append("QLD")
-            st.session_state["features"] = all_feats
-            st.session_state["regions"] = all_regions
-            st.success(f"Found {len(all_feats)} parcels.")
+with st.sidebar.expander("Add Data (KML Upload)", expanded=False):
+    kml_file = st.file_uploader("Upload .kml", type=["kml"])
+    st.caption("Uploaded polygons/lines/points will render as a new dataset.")
 
-        if st.session_state.get("features"):
-            with st.expander("Styling Options", expanded=True):
-                fc_col, fo_col = st.columns([2, 1])
-                with fc_col:
-                    fill_color = st.color_picker(
-                        "Fill color", "#FF0000", key="fill_color"
-                    )
-                with fo_col:
-                    fill_opacity = st.number_input(
-                        "Opacity",
-                        min_value=0.0,
-                        max_value=1.0,
-                        value=0.5,
-                        step=0.01,
-                        key="fill_opacity",
-                    )
+with st.sidebar.expander("Datasets on map", expanded=True):
+    ds_query_name = st.text_input("Query dataset name", value="QueryResults")
+    ds_kml_name = st.text_input("KML dataset name", value="KMLUpload")
 
-                oc_col, ow_col = st.columns([2, 1])
-                with oc_col:
-                    outline_color = st.color_picker(
-                        "Outline color", "#000000", key="outline_color"
-                    )
-                with ow_col:
-                    outline_weight = st.number_input(
-                        "Weight",
-                        min_value=1,
-                        max_value=10,
-                        value=2,
-                        step=1,
-                        key="outline_weight",
-                    )
-            with st.expander("Export Options", expanded=True):
-                folder_name = st.text_input(
-                    "KML Folder Name", value="Parcels", key="folder_name"
-                )
-                data = []
-                for i, feat in enumerate(st.session_state["features"]):
-                    props = feat.get("properties", {})
-                    if st.session_state["regions"][i] == "QLD":
-                        data.append(
-                            {"Lot": props.get("lot"), "Plan": props.get("plan")}
-                        )
-                    else:
-                        data.append(
-                            {
-                                "Lot": props.get("lotnumber"),
-                                "Plan": props.get("planlabel", ""),
-                            }
-                        )
-                df = pd.DataFrame(data)
-                gb = GridOptionsBuilder.from_dataframe(df)
-                gb.configure_column("Lot", headerName="Lot", editable=False)
-                gb.configure_column("Plan", headerName="Plan", editable=False)
-                gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-                gb.configure_pagination(paginationAutoPageSize=True)
-                gridOptions = gb.build()
-                grid_resp = AgGrid(
-                    df,
-                    gridOptions=gridOptions,
-                    height=300,
-                    update_mode=GridUpdateMode.SELECTION_CHANGED,
-                    theme="streamlit",
-                    fit_columns_on_grid_load=True,
-                    columns_auto_size_mode=ColumnsAutoSizeMode.FIT_ALL_COLUMNS_TO_VIEW,
-                )
-                sel_rows = grid_resp.get("selected_rows", [])
-                selected_features = []
-                for sel in sel_rows:
-                    for i, feat in enumerate(st.session_state["features"]):
-                        props = feat.get("properties", {})
-                        if st.session_state["regions"][i] == "QLD":
-                            if (
-                                props.get("lot") == sel["Lot"]
-                                and props.get("plan") == sel["Plan"]
-                            ):
-                                selected_features.append(feat)
-                                break
-                        else:
-                            if (
-                                props.get("lotnumber") == sel["Lot"]
-                                and props.get("planlabel") == sel["Plan"]
-                            ):
-                                selected_features.append(feat)
-                                break
-                export_region = (
-                    "QLD"
-                    if "QLD" in st.session_state["regions"]
-                    else ("NSW" if "NSW" in st.session_state["regions"] else "QLD")
-                )
-                with st.spinner("Preparing KML..."):
-                    st.download_button(
-                        "Download KML",
-                        data=generate_kml(
-                            selected_features or st.session_state["features"],
-                            export_region,
-                            fill_color,
-                            fill_opacity,
-                            outline_color,
-                            outline_weight,
-                            folder_name,
-                        ),
-                        file_name="parcels.kml",
-                    )
-                with st.spinner("Preparing SHP..."):
-                    st.download_button(
-                        "Download SHP",
-                        data=generate_shapefile(
-                            selected_features or st.session_state["features"],
-                            export_region,
-                        ),
-                        file_name="parcels.zip",
-                    )
-    else:
-        st.info(f"{selected_tab} options go here.")
-    st.markdown('</div>', unsafe_allow_html=True)
+# Hold datasets in session
+if "datasets" not in st.session_state:
+    st.session_state["datasets"] = {}  # name -> FeatureCollection
 
-with map_col:
-    base_map = folium.Map(
-        location=[-23.5, 143.0], zoom_start=5, tiles=None, zoomControl=True
-    )
-    folium.TileLayer(
-        "OpenStreetMap", name="OpenStreetMap", control=True
-    ).add_to(base_map)
-    folium.TileLayer(
-        "CartoDB positron", name="CartoDB Positron", control=True
-    ).add_to(base_map)
-    folium.TileLayer(
-        "CartoDB dark_matter", name="CartoDB Dark", control=True
-    ).add_to(base_map)
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-        attr="Google",
-        name="Google Satellite",
-        control=True,
-    ).add_to(base_map)
-    if st.session_state.get("features") and st.session_state["features"]:
-        features = st.session_state["features"]
-        fill_color = st.session_state.get("fill_color", "#FF0000")
-        outline_color = st.session_state.get("outline_color", "#000000")
-        opacity = st.session_state.get("fill_opacity", 0.5)
-        weight = st.session_state.get("outline_weight", 2)
-        folium.GeoJson(
-            data={"type": "FeatureCollection", "features": features},
-            name="Parcels",
-            style_function=lambda feat: {
-                "fillColor": fill_color,
-                "color": outline_color,
-                "weight": weight,
-                "fillOpacity": opacity,
-            },
-        ).add_to(base_map)
-        bounds = get_bounds(features)
-        base_map.fit_bounds(bounds)
-    else:
-        base_map.fit_bounds([[-39, 137], [-9, 155]])
-    folium.LayerControl(collapsed=False).add_to(base_map)
-    map_html = base_map._repr_html_()
-    st.components.v1.html(map_html, height=700, width=None, scrolling=True)
+# Run query
+if q_run and lotplan.strip():
+    try:
+        fc = run_lotplan_query(lotplan.strip())
+        if not isinstance(fc, dict) or fc.get("type") != "FeatureCollection":
+            st.sidebar.error("Your query must return a GeoJSON FeatureCollection dict.")
+        else:
+            st.session_state["datasets"][ds_query_name] = fc
+            st.sidebar.success(f"Added: {ds_query_name} ({len(fc.get('features', []))} features)")
+    except Exception as e:
+        st.sidebar.error(f"Query error: {e}")
+
+# Handle KML upload
+if kml_file is not None:
+    try:
+        fc_kml = kml_to_featurecollection(kml_file.read())
+        st.session_state["datasets"][ds_kml_name] = fc_kml
+        st.sidebar.success(f"Added: {ds_kml_name} ({len(fc_kml.get('features', []))} features)")
+    except Exception as e:
+        st.sidebar.error(f"KML parse error: {e}")
+
+# Remove dataset (optional)
+if st.session_state["datasets"]:
+    remove_key = st.selectbox("Remove dataset", ["—"] + list(st.session_state["datasets"].keys()))
+    if remove_key and remove_key != "—":
+        if st.button("Remove selected", use_container_width=True):
+            st.session_state["datasets"].pop(remove_key, None)
+
+# ---------------------------
+# Kepler map render
+# ---------------------------
+# Build KeplerGl map and add each dataset as a named GeoJSON source.
+map_ = KeplerGl(height=800, config=BASE_CONFIG)
+for name, fc in st.session_state["datasets"].items():
+    # KeplerGl Python accepts GeoJSON dicts via add_data
+    map_.add_data(data=fc, name=name)
+
+keplergl_static(map_)

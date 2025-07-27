@@ -1,22 +1,9 @@
-/* Minimal styling for the map container */
-[data-testid="stAppViewContainer"] .main .block-container {
-  padding: 0;
-}
-
-.map-container {
-  height: 100vh;
-  width: 100%;
-}
-
-.map-container iframe {
-  height: 100%;
-  width: 100%;
-  border: none;
-}
-
-/* Style for custom side panel */
-.side-panel {
-  width: 400px;
-  min-width: 400px;
-  padding: 1rem;
-}
+/* Kepler-like look and a tidy sidebar for the Query panel */
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 0.75rem; padding-bottom: 0.75rem;}
+section[data-testid="stSidebar"] {width: 360px !important;}
+/* Sidebar form elements */
+.stSidebar .stMarkdown h2, .stSidebar .stMarkdown h3 {margin-bottom: .5rem;}
+.stSidebar .stButton>button {font-weight:600; border-radius:6px;}
+.stSidebar .stTextInput>div>div>input,
+.stSidebar textarea {border-radius:6px;}

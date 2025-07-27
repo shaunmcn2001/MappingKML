@@ -1,26 +1,28 @@
-# Parcel Viewer
+# MappingKML — Streamlit + Kepler.gl layout with Query bar
 
-This repository contains a small Streamlit application for viewing cadastral parcels.
-Users can search for Queensland (QLD) or New South Wales (NSW) parcels by lot and plan, visualize them on a map and export the results as KML or shapefiles.
+This app keeps Streamlit and embeds **Kepler.gl** (`streamlit-keplergl`) to replicate the classic Kepler left panel (Layers/Filters/Interactions) and adds a **separate Query bar** (Streamlit sidebar) that drives the datasets shown on the map.
 
-## Setup
-
-Install the required packages:
-
+## Install & Run
 ```bash
 pip install -r requirements.txt
-```
-
-Run the tests to make sure everything works:
-
-```bash
-pytest
-```
-
-## Running the app
-
-Start the Streamlit server and open the parcel viewer in your browser:
-
-```bash
 streamlit run app.py
+```
+
+Using the Query bar
+•Paste your Lot/Plan pattern (e.g., 169-173, 203, 220, 246, 329//DP753311 or 1RP912949).
+•Wire your existing ArcGIS/Qld cadastral query inside run_lotplan_query() to return a GeoJSON FeatureCollection (polygons preferred).
+•Upload KML files to add more polygon/line/point datasets.
+
+Notes
+•Datasets are passed to Kepler as named GeoJSON FeatureCollections.
+•kepler_config.py sets the UI layout (side panel open, dark style, SE QLD default view).
+•Adjust BASE_CONFIG to set default layers, colors, tooltips, etc.
+
+---
+
+### 6) Commit and push
+```bash
+git add -A
+git commit -m "feat: Kepler.gl layout in Streamlit + Query bar; KML upload; dataset plumbing"
+git push -u origin feat/kepler-layout-with-query
 ```
