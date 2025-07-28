@@ -6,19 +6,15 @@ BASE_CONFIG = {
             "longitude": 153.0,
             "zoom": 7,
             "bearing": 0,
-            "pitch": 0,
+            "pitch": 0
         },
         "mapStyle": {
-            "styleType": "dark",
+            # Default base map: SATELLITE
+            "styleType": "satellite",
             "topLayerGroups": {},
             "visibleLayerGroups": {
-                "label": True,
-                "road": True,
-                "border": False,
-                "building": True,
-                "water": True,
-                "land": True,
-            },
+                "label": True, "road": True, "border": False, "building": True, "water": True, "land": True
+            }
         },
         "visState": {
             "filters": [],
@@ -27,8 +23,8 @@ BASE_CONFIG = {
                 "tooltip": {"fieldsToShow": {}, "enabled": True},
                 "brush": {"size": 0.5, "enabled": False},
                 "geocoder": {"enabled": False},
-                "coordinate": {"enabled": True},
-            },
+                "coordinate": {"enabled": True}
+            }
         },
         "uiState": {
             "readOnly": False,
@@ -38,8 +34,8 @@ BASE_CONFIG = {
                 "visibleLayers": {"show": True},
                 "mapLegend": {"show": True},
                 "toggle3d": {"show": True},
-                "splitMap": {"show": False},
-            },
-        },
-    },
+                "splitMap": {"show": False}
+            }
+        }
+    }
 }
