@@ -391,8 +391,6 @@ with st.sidebar.expander("Export / Download", expanded=False):
 
 
 # --------------------------------------------------------------------------------------
-
-# --------------------------------------------------------------------------------------
 # Kepler map render (auto-zoom + satellite default + safe fallback)
 # --------------------------------------------------------------------------------------
 data_bundle = {name: fc for name, fc in st.session_state.get("datasets", {}).items()}
@@ -411,40 +409,29 @@ if data_bundle and st.session_state.get("__refit__", False):
         cfg["config"]["mapState"]["zoom"]      = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
     st.session_state["__refit__"] = False
 
-# --- Mapbox token wiring + fallback ---
-mapbox_token = (
-    st.secrets.get("MAPBOX_API_KEY")
-    or os.getenv("MAPBOX_API_KEY")
-)
+# Mapbox token from secrets or env
+mapbox_token = st.secrets.get("MAPBOX_API_KEY") or os.getenv("MAPBOX_API_KEY")
 
-# Tiny debug (you can comment these out later)
-st.sidebar.caption(
-    f"Satellite token: {'yes' if mapbox_token else 'no'}"
-)
-
-# If no token but style requests satellite, switch to dark to avoid a blank map
+# If no token but satellite requested, fallback to dark to avoid blank tiles
 try:
-    style_type = cfg["config"]["mapStyle"].get("styleType")
-    if style_type == "satellite" and not mapbox_token:
+    if cfg["config"]["mapStyle"].get("styleType") == "satellite" and not mapbox_token:
         cfg["config"]["mapStyle"]["styleType"] = "dark"
         st.warning("No MAPBOX_API_KEY found; switched basemap to 'dark' as a fallback.")
 except Exception:
     pass
 
-# Force a valid Mapbox Satellite style id (some envs need it explicit)
-cfg.setdefault("config", {}).setdefault("mapStyle", {}).setdefault("mapStyles", {})
-cfg["config"]["mapStyle"]["mapStyles"]["satellite"] = {
-    "id": "satellite",
-    "label": "Satellite",
-    "style": "mapbox://styles/mapbox/satellite-v9",
-    "accessToken": None  # provided via mapbox_api_key param below
-}
-
+# IMPORTANT: do NOT inject custom mapStyles, and do NOT pass `data=` here.
 m = KeplerGl(
     height=800,
-    data=data_bundle if data_bundle else None,
     config=cfg if cfg else None,
-    mapbox_api_key=mapbox_token  # <- critical
+    mapbox_api_key=mapbox_token  # Kepler will request Satellite if styleType='satellite'
 )
-keplergl_static(m)
 
+# Add datasets AFTER construction to avoid trait validation issues
+for name, fc in data_bundle.items():
+    try:
+        m.add_data(data=fc, name=name)
+    except Exception as e:
+        st.warning(f"Failed to add dataset '{name}': {e}")
+
+keplergl_static(m)
