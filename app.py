@@ -391,29 +391,60 @@ with st.sidebar.expander("Export / Download", expanded=False):
 
 
 # --------------------------------------------------------------------------------------
-# Kepler map render (auto-zoom + satellite default)
+
 # --------------------------------------------------------------------------------------
-# Build the data bundle Kepler expects: { name: FeatureCollection, ... }
+# Kepler map render (auto-zoom + satellite default + safe fallback)
+# --------------------------------------------------------------------------------------
 data_bundle = {name: fc for name, fc in st.session_state.get("datasets", {}).items()}
 
-# Start from BASE_CONFIG, but REMOVE explicit layers so Kepler auto-creates them.
 cfg = copy.deepcopy(BASE_CONFIG)
 if "config" in cfg and "visState" in cfg["config"]:
     cfg["config"]["visState"].pop("layers", None)
 
-# Auto-center on data bbox after query/upload/remove
+# Auto-center after add/remove
 if data_bundle and st.session_state.get("__refit__", False):
     bbox = compute_bbox_of_featurecollections(data_bundle)
     if bbox and "config" in cfg and "mapState" in cfg["config"]:
         minx, miny, maxx, maxy = bbox
-        center_lon = (minx + maxx) / 2.0
-        center_lat = (miny + maxy) / 2.0
-        cfg["config"]["mapState"]["longitude"] = center_lon
-        cfg["config"]["mapState"]["latitude"] = center_lat
-        cfg["config"]["mapState"]["zoom"] = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
-    st.session_state["__refit__"] = False  # consume flag
+        cfg["config"]["mapState"]["longitude"] = (minx + maxx) / 2.0
+        cfg["config"]["mapState"]["latitude"]  = (miny + maxy) / 2.0
+        cfg["config"]["mapState"]["zoom"]      = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
+    st.session_state["__refit__"] = False
 
-# IMPORTANT: pass datasets via `data=` so Kepler auto-adds layers
-mapbox_token = st.secrets.get("MAPBOX_API_KEY", None)  # needed for satellite styles on some setups
-m = KeplerGl(height=800, data=data_bundle if data_bundle else None, config=cfg if cfg else None, mapbox_api_key=mapbox_token)
+# --- Mapbox token wiring + fallback ---
+mapbox_token = (
+    st.secrets.get("MAPBOX_API_KEY")
+    or os.getenv("MAPBOX_API_KEY")
+)
+
+# Tiny debug (you can comment these out later)
+st.sidebar.caption(
+    f"Satellite token: {'yes' if mapbox_token else 'no'}"
+)
+
+# If no token but style requests satellite, switch to dark to avoid a blank map
+try:
+    style_type = cfg["config"]["mapStyle"].get("styleType")
+    if style_type == "satellite" and not mapbox_token:
+        cfg["config"]["mapStyle"]["styleType"] = "dark"
+        st.warning("No MAPBOX_API_KEY found; switched basemap to 'dark' as a fallback.")
+except Exception:
+    pass
+
+# Force a valid Mapbox Satellite style id (some envs need it explicit)
+cfg.setdefault("config", {}).setdefault("mapStyle", {}).setdefault("mapStyles", {})
+cfg["config"]["mapStyle"]["mapStyles"]["satellite"] = {
+    "id": "satellite",
+    "label": "Satellite",
+    "style": "mapbox://styles/mapbox/satellite-v9",
+    "accessToken": None  # provided via mapbox_api_key param below
+}
+
+m = KeplerGl(
+    height=800,
+    data=data_bundle if data_bundle else None,
+    config=cfg if cfg else None,
+    mapbox_api_key=mapbox_token  # <- critical
+)
 keplergl_static(m)
+
