@@ -424,5 +424,9 @@ if bbox and "config" in cfg and "mapState" in cfg["config"]:
     cfg["config"]["mapState"]["latitude"] = center_lat
     cfg["config"]["mapState"]["zoom"] = cfg["config"]["mapState"].get("zoom", 9)
 # Pass datasets via data= so Kepler auto-adds layers
-m = KeplerGl(height=800, data=data_bundle if data_bundle else None, config=cfg if cfg else None)
+# KeplerGl expects a dictionary for the `data` trait. When no datasets are
+# loaded `data_bundle` will be an empty dict which evaluates to ``False`` in
+# a boolean context. Passing ``None`` results in a TraitError, so always pass
+# a dictionary.
+m = KeplerGl(height=800, data=data_bundle or {}, config=cfg or {})
 keplergl_static(m)
