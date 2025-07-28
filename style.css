@@ -1,9 +1,12 @@
-/* Kepler-like look and a tidy sidebar for the Query panel */
-#MainMenu, footer {visibility: hidden;}
-.block-container {padding-top: 0.75rem; padding-bottom: 0.75rem;}
-section[data-testid="stSidebar"] {width: 360px !important;}
+/* Hide Streamlit header/menu/footer */
+header[data-testid="stHeader"] { display: none; }
+#MainMenu, footer { visibility: hidden; }
+
+/* Kepler-like look and a tidy sidebar */
+.block-container { padding-top: 0.5rem; padding-bottom: 0.75rem; }
+section[data-testid="stSidebar"] { width: 360px !important; }
+
 /* Sidebar form elements */
-.stSidebar .stMarkdown h2, .stSidebar .stMarkdown h3 {margin-bottom: .5rem;}
-.stSidebar .stButton>button {font-weight:600; border-radius:6px;}
-.stSidebar .stTextInput>div>div>input,
-.stSidebar textarea {border-radius:6px;}
+.stSidebar .stMarkdown h2, .stSidebar .stMarkdown h3 { margin-bottom: .5rem; }
+.stSidebar .stButton>button { font-weight:600; border-radius:6px; }
+.stSidebar .stTextInput>div>div>input, .stSidebar textarea { border-radius:6px; }
