@@ -6,4 +6,3 @@ shapely==2.0.6
 fastkml==0.12
 requests==2.32.3
 pyshp==2.3.1
-requests==2.32.3
