@@ -1,318 +1,437 @@
-# app.py
-import os
 import json
-import math
-import requests
-import pandas as pd
+from io import BytesIO
+import re
+import itertools
+import copy
+from math import inf
+import os
+import zipfile
+
 import streamlit as st
 from keplergl import KeplerGl
+from streamlit_keplergl import keplergl_static
+from shapely.geometry import mapping as shp_mapping
+from fastkml import kml
+import pandas as pd
+import requests
 
-# Prefer streamlit-keplergl if available (better sizing); else render raw HTML
-try:
-    from streamlit_keplergl import keplergl_static
-    HAS_ST_KEPLER = True
-except Exception:
-    from streamlit.components.v1 import html as st_html
-    HAS_ST_KEPLER = False
+from kepler_config import BASE_CONFIG
+import kml_utils
 
-# -------------------------
-# Config & constants
-# -------------------------
-st.set_page_config(page_title="MappingKML • Kepler", layout="wide", initial_sidebar_state="collapsed")
 
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
-MAP_STYLE = os.getenv("MAP_STYLE", "dark")  # Kepler styleType: dark|light|satellite|outdoors
-NAV_HEIGHT = 56  # px
-MAP_HEIGHT = int(os.getenv("MAP_HEIGHT", "900"))  # pixel height for Kepler map
-
-# -------------------------
-# Global styles (full-bleed + sticky top nav)
-# -------------------------
+# --------------------------------------------------------------------------------------
+# Page + CSS
+# --------------------------------------------------------------------------------------
+st.set_page_config(page_title="MappingKML — Kepler Layout + Query", layout="wide")
+# Hide Streamlit header/menu/footer; tidy sidebar
 st.markdown(
-    f"""
-<style>
-/* Remove Streamlit default padding */
-.appview-container .main .block-container {{
-  padding-top: 0rem; padding-left: 0rem; padding-right: 0rem; padding-bottom: 0rem;
-}}
-/* Top bar */
-#topbar {{
-  position: sticky; top: 0; z-index: 999;
-  height: {NAV_HEIGHT}px; background: #111; color: #fff;
-  display: flex; align-items: center; gap: 12px; padding: 0 14px;
-  border-bottom: 1px solid #222;
-}}
-#topbar .title {{ font-weight: 600; letter-spacing: .2px; }}
-#mapwrap {{ height: calc(100vh - {NAV_HEIGHT}px); }}
-.block-container .stButton > button {{ border-radius: 8px; }}
-</style>
-""",
+    "<style>" + open("style.css", "r", encoding="utf-8").read() + "</style>",
     unsafe_allow_html=True,
 )
 
-# -------------------------
+
+# --------------------------------------------------------------------------------------
 # Helpers
-# -------------------------
-def features_to_rows(fc: dict) -> pd.DataFrame:
-    """Flatten FeatureCollection -> DataFrame with a 'geometry' column containing the geometry dict."""
-    feats = fc.get("features") or []
-    rows = []
-    for f in feats:
-        props = (f.get("properties") or {}).copy()
-        props["geometry"] = f.get("geometry")
-        rows.append(props)
-    return pd.DataFrame(rows)
+# --------------------------------------------------------------------------------------
+def compute_bbox_of_featurecollections(named_fcs: dict[str, dict]):
+    """Return (minx, miny, maxx, maxy) across all FeatureCollections; None if empty."""
+    minx, miny, maxx, maxy = inf, inf, -inf, -inf
 
-def _extract_coords(geom: dict):
-    """Return flat list of [lon, lat] pairs from any GeoJSON geometry."""
-    coords_out = []
-    def rec(node):
-        if isinstance(node, (list, tuple)) and node and isinstance(node[0], (int, float)):
-            coords_out.append(node[:2])
-        elif isinstance(node, (list, tuple)):
-            for child in node:
-                rec(child)
-    if geom:
-        rec(geom.get("coordinates"))
-    return coords_out
+    def walk_coords(coords):
+        nonlocal minx, miny, maxx, maxy
+        if isinstance(coords, (list, tuple)) and coords and isinstance(coords[0], (int, float)):
+            x, y = coords[:2]
+            if x < minx: minx = x
+            if y < miny: miny = y
+            if x > maxx: maxx = x
+            if y > maxy: maxy = y
+        elif isinstance(coords, (list, tuple)):
+            for c in coords:
+                walk_coords(c)
 
-def featurecollection_bbox(fc: dict):
-    """Compute [minx, miny, maxx, maxy] from FeatureCollection; if empty, default near Australia center."""
-    minx = miny = math.inf
-    maxx = maxy = -math.inf
-    for f in fc.get("features", []):
-        for (x, y) in _extract_coords(f.get("geometry") or {}):
-            minx = min(minx, x); miny = min(miny, y)
-            maxx = max(maxx, x); maxy = max(maxy, y)
-    if math.isinf(minx):
-        return [133.0, -26.0, 134.5, -24.5]
-    return [minx, miny, maxx, maxy]
+    for _, fc in named_fcs.items():
+        if not fc or fc.get("type") != "FeatureCollection":
+            continue
+        for feat in fc.get("features", []):
+            geom = (feat or {}).get("geometry")
+            if not geom:
+                continue
+            walk_coords(geom.get("coordinates"))
 
-def center_from_bbox(b):  # (lon, lat)
-    return ((b[0]+b[2])/2.0, (b[1]+b[3])/2.0)
+    if minx is inf:
+        return None
+    return (minx, miny, maxx, maxy)
 
-def build_kepler_config(data_id: str, df: pd.DataFrame | None, fc: dict | None):
-    """Build a Kepler config with a GeoJSON layer bound to 'geometry' column, auto-center to data bbox."""
-    if fc:
-        b = featurecollection_bbox(fc)
-        lon, lat = center_from_bbox(b)
-        # crude zoom heuristic based on bbox size
-        lon_span, lat_span = (b[2]-b[0]), (b[3]-b[1])
-        span = max(lon_span, lat_span)
-        zoom = 9 if span > 0.3 else 12 if span > 0.08 else 13.5
-    else:
-        lon, lat, zoom = 153.0260, -27.4705, 9  # Brisbane default
 
-    # Tooltip: show all non-geometry columns if we have data
-    fields = []
-    if isinstance(df, pd.DataFrame):
-        for c in df.columns:
-            if c != "geometry":
-                fields.append({"name": c, "format": None})
+def _chunks(seq, n):
+    it = iter(seq)
+    while True:
+        block = list(itertools.islice(it, n))
+        if not block:
+            return
+        yield block
 
-    config = {
-        "version": "v1",
-        "config": {
-            "visState": {
-                "filters": [],
-                "layers": [
-                    {
-                        "id": "parcels",
-                        "type": "geojson",
-                        "config": {
-                            "dataId": data_id,
-                            "label": "Parcels",
-                            "color": [18, 92, 255],
-                            "columns": {"geojson": "geometry"},
-                            "isVisible": True,
-                            "visConfig": {
-                                "opacity": 0.6, "strokeOpacity": 0.9,
-                                "thickness": 1.2, "stroked": True, "filled": True,
-                                "enable3d": False, "wireframe": False
-                            },
-                        },
-                        "visualChannels": {}
-                    }
-                ],
-                "interactionConfig": {
-                    "tooltip": {"enabled": True, "fieldsToShow": {data_id: fields}}
-                },
-                "layerBlending": "normal",
-                "animationConfig": {"enabled": False}
-            },
-            "mapState": {
-                "bearing": 0, "dragRotate": False,
-                "latitude": lat, "longitude": lon,
-                "pitch": 0, "zoom": zoom
-            },
-            "mapStyle": {"styleType": MAP_STYLE}
-        }
-    }
-    return config
 
-def render_kepler(df: pd.DataFrame | None, fc: dict | None):
-    """Render KeplerGl in Streamlit."""
-    data_id = "query_results"
-    kg = KeplerGl(
-        height=MAP_HEIGHT,
-        data={data_id: df if df is not None else pd.DataFrame()},
-        config=build_kepler_config(data_id, df, fc)
-    )
-    if HAS_ST_KEPLER:
-        keplergl_static(kg)
-    else:
-        st_html(kg._repr_html_(), height=MAP_HEIGHT, scrolling=False)
+def _split_lot_plan(lotplan: str):
+    # '1RP912949' -> ('1','RP912949') ; also accepts '1 RP912949'
+    m = re.match(r"^\s*([0-9]+)\s*([A-Z]{1,3}[0-9A-Z]+)\s*$", lotplan)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
 
-# --- KML export (lightweight) ---
-def fc_to_kml_bytes(fc: dict) -> bytes:
+
+def normalize_lotplan_input(text: str):
     """
-    Convert a FeatureCollection to a simple KML (Polygon/MultiPolygon/Point/LineString).
-    Uses simplekml for minimal dependencies.
+    Return canonical lotplan tokens from messy input.
+
+    Handles:
+      - 1/RP912949, L1 RP912949, 1 RP912949, 1RP912949
+      - '169-173, 203, 220 // DP753311' -> expands to 169..173 + singles with plan 'DP753311'
+      - de-duplicates and strips leading zeros on lot numbers.
     """
+    if not text:
+        return []
+
+    t = text.upper()
+    # Normalise common words
+    t = t.replace("REGISTERED PLAN", "RP").replace("SURVEY PLAN", "SP")
+    t = t.replace("CROWN PLAN A", "CPA").replace("CROWN PLAN", "CP")
+    t = t.replace(" ON ", " ").replace(" OF ", " ").replace(":", " ")
+
+    # Split on semicolons/newlines into segments; each may contain // syntax
+    parts = re.split(r"[;\n]+", t)
+
+    def expand_range_list(numlist_str):
+        nums = []
+        for piece in re.split(r"[,\s]+", numlist_str.strip()):
+            if not piece:
+                continue
+            if "-" in piece:
+                a, b = piece.split("-", 1)
+                if a.isdigit() and b.isdigit():
+                    lo, hi = int(a), int(b)
+                    step = 1 if hi >= lo else -1
+                    nums.extend([str(x) for x in range(lo, hi + step, step)])
+            elif piece.isdigit():
+                nums.append(piece)
+        return nums
+
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+
+        # Case A: '169-173, 203 // DP753311'
+        m = re.search(r"(.+?)\s*//\s*([A-Z]{1,3})\s*([0-9A-Z]+)", p)
+        if m:
+            lots = expand_range_list(m.group(1))
+            plan = f"{m.group(2)}{m.group(3)}"
+            out.extend([f"{n}{plan}" for n in lots])
+            continue
+
+        # Case B: '1/RP912949' or '1 RP912949'
+        m = re.match(r"^([0-9]+)\s*[\/ ]\s*([A-Z]{1,3})\s*([0-9A-Z]+)$", p)
+        if m:
+            out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
+            continue
+
+        # Case C: 'L1 RP912949' or 'L1RP912949'
+        m = re.match(r"^L?\s*([0-9]+)\s*([A-Z]{1,3})\s*([0-9A-Z]+)$", p)
+        if m:
+            out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
+            continue
+
+        # Case D: already canonical '1RP912949'
+        m = re.match(r"^([0-9]+)([A-Z]{1,3})([0-9A-Z]+)$", p)
+        if m:
+            out.append(p)
+            continue
+
+        st.info(f"Ignored unrecognized token: {p}")
+
+    # De-duplicate + strip leading zeros on lot numbers
+    clean = []
+    for token in out:
+        m = re.match(r"^0*([0-9]+)([A-Z]{1,3})([0-9A-Z]+)$", token)
+        if m:
+            token = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+        clean.append(token)
+
+    seen, uniq = set(), []
+    for lp in clean:
+        if lp not in seen:
+            seen.add(lp)
+            uniq.append(lp)
+    return uniq
+
+
+QLD_FEATURESERVER = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer/4/query"
+NSW_FEATURESERVER = "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query"
+
+
+def _safe_request(url: str, params: dict) -> dict:
     try:
-        import simplekml
+        r = requests.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        raise RuntimeError("simplekml not installed. Add 'simplekml' to requirements.txt") from e
+        st.error(f"Request failed: {e}")
+        return {"type": "FeatureCollection", "features": []}
 
-    kml = simplekml.Kml()
-    feats = fc.get("features", [])
-    for i, f in enumerate(feats, 1):
-        geom = (f or {}).get("geometry") or {}
-        gtype = geom.get("type")
-        props = (f or {}).get("properties") or {}
-        name = str(props.get("name") or props.get("LOTPLAN") or props.get("lot_plan") or f"feature_{i}")
 
-        def ring_to_coords(ring):
-            # ring: [[lon,lat], ...]
-            return [(pt[0], pt[1]) for pt in ring if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+def run_lotplan_query(raw_text: str) -> dict:
+    """
+    Normalise input, route QLD vs NSW, and return a GeoJSON FeatureCollection.
+    QLD normalised tokens look like '1RP912949'; NSW will typically be entered using //DP syntax.
+    """
+    tokens = normalize_lotplan_input(raw_text)
+    if not tokens:
+        return {"type": "FeatureCollection", "features": []}
 
-        if gtype == "Polygon":
-            for idx, ring in enumerate(geom.get("coordinates", [])):
-                poly = kml.newpolygon(name=name if idx == 0 else f"{name}_{idx}")
-                poly.outerboundaryis = ring_to_coords(ring)
-                poly.style.linestyle.width = 1
-                poly.style.polystyle.fill = 1
-        elif gtype == "MultiPolygon":
-            for pidx, polycoords in enumerate(geom.get("coordinates", []), 1):
-                for ridx, ring in enumerate(polycoords):
-                    poly = kml.newpolygon(name=f"{name}_{pidx}_{ridx}")
-                    poly.outerboundaryis = ring_to_coords(ring)
-                    poly.style.linestyle.width = 1
-                    poly.style.polystyle.fill = 1
-        elif gtype == "Point":
-            coords = geom.get("coordinates", [])
-            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
-                kml.newpoint(name=name, coords=[(coords[0], coords[1])])
-        elif gtype == "LineString":
-            line = kml.newlinestring(name=name)
-            line.coords = ring_to_coords(geom.get("coordinates", []))
-            line.style.linestyle.width = 2
-        elif gtype == "MultiLineString":
-            for lidx, line_coords in enumerate(geom.get("coordinates", []), 1):
-                line = kml.newlinestring(name=f"{name}_{lidx}")
-                line.coords = ring_to_coords(line_coords)
-                line.style.linestyle.width = 2
-        # other types ignored for brevity
-    return kml.kml().encode("utf-8")
+    # Separate likely NSW by plan prefixes (DP/SP) – those won't return from the QLD endpoint
+    qld_tokens = [lp for lp in tokens if not (lp.startswith("DP") or lp.startswith("SP"))]
+    nsw_reported = [lp for lp in tokens if (lp.startswith("DP") or lp.startswith("SP"))]
+    if nsw_reported:
+        st.warning("Detected NSW DP/SP plans; routing those to NSW cadastre.")
 
-# -------------------------
-# Session state
-# -------------------------
-if "fc" not in st.session_state: st.session_state.fc = None
-if "df" not in st.session_state: st.session_state.df = None
-if "last_error" not in st.session_state: st.session_state.last_error = None
+    features = []
 
-# -------------------------
-# Top nav
-# -------------------------
-st.markdown(
-    f"""
-<div id="topbar">
-  <div class="title">MappingKML • Kepler</div>
-  <div style="margin-left:auto;"></div>
-</div>
-""",
-    unsafe_allow_html=True,
+    # QLD: lotplan IN (...) primary, fallback to lot/plan
+    if qld_tokens:
+        for chunk in _chunks(qld_tokens, 150):
+            where = "lotplan IN ({})".format(",".join(f"'{lp}'" for lp in chunk))
+            params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326", "f": "geojson"}
+            gj = _safe_request(QLD_FEATURESERVER, params)
+            features.extend(gj.get("features", []))
+
+        found_lp = {(f.get("properties") or {}).get("lotplan") for f in features}
+        missing = [lp for lp in qld_tokens if lp not in found_lp]
+        for lp in missing:
+            lot, plan = _split_lot_plan(lp)
+            if not lot or not plan:
+                continue
+            where = f"lot='{lot}' AND plan='{plan}'"
+            params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326", "f": "geojson"}
+            gj = _safe_request(QLD_FEATURESERVER, params)
+            features.extend(gj.get("features", []))
+
+    # NSW: for entries like "169-173 // DP753311" normaliser produced 169DP753311, etc.
+    # We query by lotnumber + plannumber (section optional).
+    for lp in nsw_reported:
+        # If the user typed just "//DPxxxx" with ranges it got expanded to '169DPxxxx'; split
+        m = re.match(r"^([0-9]+)(DP|SP)([0-9A-Z]+)$", lp)
+        if not m:
+            continue
+        lot_val, plan_prefix, plan_num = m.group(1), m.group(2), m.group(3)
+        where = f"lotnumber='{lot_val}' AND (sectionnumber IS NULL OR sectionnumber='') AND plannumber={re.sub('[^0-9]', '', plan_num)}"
+        params = {
+            "where": where,
+            "outFields": "lotnumber,sectionnumber,planlabel,plannumber",
+            "outSR": "4326",
+            "returnGeometry": "true",
+            "f": "geoJSON",
+        }
+        gj = _safe_request(NSW_FEATURESERVER, params)
+        features.extend(gj.get("features", []))
+
+    st.info(f"Queried {len(tokens)} token(s); returned {len(features)} feature(s).")
+    return {"type": "FeatureCollection", "features": features}
+
+
+def kml_to_featurecollection_from_bytes(kbytes: bytes) -> dict:
+    """Parse KML/KMZ bytes to a GeoJSON FeatureCollection (polygons only are rendered)."""
+    # KMZ support
+    if zipfile.is_zipfile(BytesIO(kbytes)):
+        with zipfile.ZipFile(BytesIO(kbytes)) as z:
+            # pick the first .kml entry
+            kml_name = next((n for n in z.namelist() if n.lower().endswith(".kml")), None)
+            if not kml_name:
+                return {"type": "FeatureCollection", "features": []}
+            kbytes = z.read(kml_name)
+
+    kdoc = kml.KML()
+    kdoc.from_string(kbytes)
+
+    def collect(node):
+        geoms = []
+        if hasattr(node, "geometry") and node.geometry is not None:
+            geoms.append(node.geometry)
+        if hasattr(node, "features") and node.features() is not None:
+            for f in node.features():
+                geoms.extend(collect(f))
+        return geoms
+
+    features = []
+    for f in getattr(kdoc, "features")() or []:
+        for g in collect(f):
+            try:
+                features.append({"type": "Feature", "geometry": shp_mapping(g), "properties": {}})
+            except Exception:
+                pass
+
+    if not features:
+        for g in collect(kdoc):
+            try:
+                features.append({"type": "Feature", "geometry": shp_mapping(g), "properties": {}})
+            except Exception:
+                pass
+
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _approx_zoom_from_bbox(minx, miny, maxx, maxy):
+    """Very rough zoom estimate for WebMercator; good enough for auto-fit."""
+    span_lon = max(1e-6, maxx - minx)
+    span_lat = max(1e-6, maxy - miny)
+    span = max(span_lon, span_lat)
+    # crude mapping: world ~360 deg -> z ~1; 0.01 deg -> ~15
+    import math
+    z = max(3.0, min(16.0, 1.0 + 8.0 - math.log(span, 2)))  # clamp
+    return float(z)
+
+
+# --------------------------------------------------------------------------------------
+# Sidebar UI (Query + Upload + Dataset management)
+# --------------------------------------------------------------------------------------
+st.sidebar.title("Query & Data")
+st.sidebar.caption("Add a **Query** panel next to Kepler’s Layers/Filters to drive datasets rendered on the map.")
+
+with st.sidebar.expander("Query (Lot/Plan search)", expanded=True):
+    lotplan = st.text_area(
+        "Enter Lot/Plan (supports comma/range syntax):",
+        placeholder="e.g. 169-173, 203 // DP753311 or 1RP912949",
+        height=100,
+    )
+    q_run = st.button("Run Query", type="primary", use_container_width=True)
+    st.caption("The query returns a **GeoJSON FeatureCollection**.")
+
+with st.sidebar.expander("Add Data (KML/KMZ Upload)", expanded=False):
+    kml_file = st.file_uploader("Upload .kml or .kmz", type=["kml", "kmz"])
+    st.caption("Uploaded polygons/lines/points render as a new dataset.")
+
+with st.sidebar.expander("Datasets on map", expanded=True):
+    ds_query_name = st.text_input("Query dataset name", value="QueryResults")
+    ds_kml_name = st.text_input("KML dataset name", value="KMLUpload")
+    # *** Moved remove control into the SIDEBAR (as requested) ***
+    remove_key = None
+    if "datasets" in st.session_state and st.session_state["datasets"]:
+        remove_key = st.selectbox("Remove dataset", ["—"] + list(st.session_state["datasets"].keys()))
+        if remove_key and remove_key != "—":
+            if st.button("Remove selected", use_container_width=True):
+                st.session_state["datasets"].pop(remove_key, None)
+                st.success(f"Removed: {remove_key}")
+                # mark that we should re-fit to remaining data
+                st.session_state["__refit__"] = True
+
+
+# Hold datasets in session
+if "datasets" not in st.session_state:
+    st.session_state["datasets"] = {}  # name -> FeatureCollection
+
+# Run query
+if q_run and lotplan.strip():
+    try:
+        fc = run_lotplan_query(lotplan.strip())
+        if not isinstance(fc, dict) or fc.get("type") != "FeatureCollection":
+            st.sidebar.error("The query must return a GeoJSON FeatureCollection dict.")
+        else:
+            st.session_state["datasets"][ds_query_name] = fc
+            st.success(f"Added: {ds_query_name} ({len(fc.get('features', []))} features)")
+            st.info(f"Datasets now: {', '.join(st.session_state['datasets'].keys())}")
+            st.session_state["__refit__"] = True  # *** trigger auto-zoom ***
+    except Exception as e:
+        st.sidebar.error(f"Query error: {e}")
+
+# Handle KML/KMZ upload
+if kml_file is not None:
+    try:
+        file_bytes = kml_file.getvalue()  # robust for Streamlit's uploader
+        fc_kml = kml_to_featurecollection_from_bytes(file_bytes)
+        st.session_state["datasets"][ds_kml_name] = fc_kml
+        st.sidebar.success(f"Added: {ds_kml_name} ({len(fc_kml.get('features', []))} features)")
+        st.session_state["__refit__"] = True  # *** trigger auto-zoom ***
+    except Exception as e:
+        st.sidebar.error(f"KML/KMZ parse error: {e}")
+
+# --------------------------------------------------------------------------------------
+# Export / Download
+# --------------------------------------------------------------------------------------
+with st.sidebar.expander("Export / Download", expanded=False):
+    selected_ds = st.selectbox(
+        "Select dataset to export",
+        list(st.session_state["datasets"].keys()) if st.session_state["datasets"] else [],
+    )
+    region = st.selectbox("Region (attribute schema)", ["QLD", "NSW"])
+    fill_hex = st.text_input("Fill colour (hex)", "#00AAFF")
+    fill_opacity = st.slider("Fill opacity", 0.0, 1.0, 0.3, 0.05)
+    outline_hex = st.text_input("Outline colour (hex)", "#000000")
+    outline_weight = st.number_input("Outline width (px)", 1, 10, 2)
+    if selected_ds:
+        feats = st.session_state["datasets"][selected_ds].get("features", [])
+        kml_str = kml_utils.generate_kml(feats, region, fill_hex, fill_opacity, outline_hex, outline_weight, selected_ds)
+        st.download_button(
+            "Download KML",
+            data=kml_str.encode("utf-8"),
+            file_name=f"{selected_ds}.kml",
+            mime="application/vnd.google-earth.kml+xml",
+            use_container_width=True,
+        )
+        try:
+            shp_bytes = kml_utils.generate_shapefile(feats, region)
+            st.download_button(
+                "Download Shapefile (.zip)",
+                data=shp_bytes,
+                file_name=f"{selected_ds}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        except RuntimeError as e:
+            st.warning(f"Shapefile export unavailable: {e}")
+
+
+# --------------------------------------------------------------------------------------
+# Kepler map render (auto-zoom + satellite default + safe fallback)
+# --------------------------------------------------------------------------------------
+data_bundle = {name: fc for name, fc in st.session_state.get("datasets", {}).items()}
+
+cfg = copy.deepcopy(BASE_CONFIG)
+if "config" in cfg and "visState" in cfg["config"]:
+    cfg["config"]["visState"].pop("layers", None)
+
+# Auto-center after add/remove
+if data_bundle and st.session_state.get("__refit__", False):
+    bbox = compute_bbox_of_featurecollections(data_bundle)
+    if bbox and "config" in cfg and "mapState" in cfg["config"]:
+        minx, miny, maxx, maxy = bbox
+        cfg["config"]["mapState"]["longitude"] = (minx + maxx) / 2.0
+        cfg["config"]["mapState"]["latitude"]  = (miny + maxy) / 2.0
+        cfg["config"]["mapState"]["zoom"]      = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
+    st.session_state["__refit__"] = False
+
+# Mapbox token from secrets or env
+mapbox_token = st.secrets.get("MAPBOX_API_KEY") or os.getenv("MAPBOX_API_KEY")
+
+# If no token but satellite requested, fallback to dark to avoid blank tiles
+try:
+    if cfg["config"]["mapStyle"].get("styleType") == "satellite" and not mapbox_token:
+        cfg["config"]["mapStyle"]["styleType"] = "dark"
+        st.warning("No MAPBOX_API_KEY found; switched basemap to 'dark' as a fallback.")
+except Exception:
+    pass
+
+# IMPORTANT: do NOT inject custom mapStyles, and do NOT pass `data=` here.
+m = KeplerGl(
+    height=800,
+    config=cfg if cfg else None,
+    mapbox_api_key=mapbox_token  # Kepler will request Satellite if styleType='satellite'
 )
 
-# -------------------------
-# Query UI (popover if available; otherwise sidebar)
-# -------------------------
-def query_form():
-    st.write("**Bulk Lot/Plan Search**")
-    st.caption("Enter one per line (e.g. `1/DP1104787`, `246//DP753311`, `329/753311`)")
+# Add datasets AFTER construction to avoid trait validation issues
+for name, fc in data_bundle.items():
+    try:
+        m.add_data(data=fc, name=name)
+    except Exception as e:
+        st.warning(f"Failed to add dataset '{name}': {e}")
 
-    lots_text = st.text_area("Lots / Plans", value="", height=160, label_visibility="collapsed", key="lotplan_input")
-    c1, c2, c3 = st.columns([1, 1, 2])
-    run = c1.button("Run Query", type="primary")
-    clear = c2.button("Clear")
-
-    if run:
-        if not API_BASE:
-            st.error("API_BASE is not set. Set env var API_BASE to your backend base URL.")
-        else:
-            try:
-                resp = requests.post(f"{API_BASE}/search", json={"q": lots_text}, timeout=120)
-                resp.raise_for_status()
-                fc = resp.json()
-                # Accept FC, {features:[]}, or [] and coerce into FC
-                if isinstance(fc, dict) and fc.get("type") == "FeatureCollection":
-                    pass
-                elif isinstance(fc, dict) and "features" in fc:
-                    fc = {"type": "FeatureCollection", "features": fc["features"]}
-                elif isinstance(fc, list):
-                    fc = {"type": "FeatureCollection", "features": fc}
-                else:
-                    raise ValueError("Response is not a FeatureCollection.")
-
-                df = features_to_rows(fc)
-                st.session_state.fc = fc
-                st.session_state.df = df
-                st.session_state.last_error = None
-                st.success(f"Loaded {len(df)} feature(s). Map updated.")
-            except Exception as e:
-                st.session_state.last_error = str(e)
-                st.error(f"Query failed: {e}")
-
-    if clear:
-        st.session_state.fc = None
-        st.session_state.df = None
-        st.session_state.last_error = None
-        st.success("Cleared results.")
-
-    # Exports (if we have data)
-    if st.session_state.fc:
-        gj = json.dumps(st.session_state.fc, ensure_ascii=False)
-        st.download_button("Download GeoJSON", gj, file_name="query.geojson", mime="application/geo+json")
-        try:
-            kml_bytes = fc_to_kml_bytes(st.session_state.fc)
-            st.download_button(
-                "Download KML",
-                kml_bytes,
-                file_name="query.kml",
-                mime="application/vnd.google-earth.kml+xml"
-            )
-        except Exception as e:
-            st.info(f"KML export unavailable: {e}")
-
-# Popover (Streamlit >= 1.31) or sidebar fallback
-if hasattr(st, "popover"):
-    navcols = st.columns([0.82, 0.18])
-    with navcols[1]:
-        with st.popover("Query", use_container_width=True):
-            query_form()
-else:
-    with st.sidebar:
-        st.header("Query")
-        query_form()
-
-# -------------------------
-# Map area (full-height under nav)
-# -------------------------
-st.markdown('<div id="mapwrap">', unsafe_allow_html=True)
-render_kepler(st.session_state.df, st.session_state.fc)
-st.markdown('</div>', unsafe_allow_html=True)
-
-# Optional: show last error unobtrusively
-if st.session_state.last_error:
-    st.info(f"Last error: {st.session_state.last_error}")
+keplergl_static(m)
