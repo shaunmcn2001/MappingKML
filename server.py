@@ -75,10 +75,10 @@ def search():
             features.append(feat)
             regions.append('QLD')
 
-        # South Australia search using broad text
+        # South Australia search using parcel identifier
+        parcel_id = user_input.strip().upper()
         sa_params = {
-            'searchText': user_input,
-            'where': '1=1',
+            'where': f"UPPER(PARCEL_ID)='{parcel_id}'",
             'outFields': '*',
             'outSR': '4326',
             'returnGeometry': 'true',

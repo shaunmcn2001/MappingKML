@@ -193,10 +193,12 @@ def _safe_request(url: str, params: dict) -> dict:
 
 
 def _run_sa_query(raw_text: str) -> dict:
-    """Query the South Australia parcels layer using a broad search."""
+    """Query the South Australia parcels layer by parcel identifier."""
+    parcel_id = raw_text.strip().upper()
+    if not parcel_id:
+        return {"type": "FeatureCollection", "features": []}
     params = {
-        "searchText": raw_text,
-        "where": "1=1",
+        "where": f"UPPER(PARCEL_ID)='{parcel_id}'",
         "outFields": "*",
         "returnGeometry": "true",
         "outSR": "4326",
