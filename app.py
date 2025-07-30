@@ -7,6 +7,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 from backend.sa_query import search_sa
+from backend.vic_query import search_vic
 
 import kml_utils
 
@@ -15,7 +16,6 @@ import kml_utils
 # Page + CSS
 # --------------------------------------------------------------------------------------
 st.set_page_config(page_title="MappingKML — Mapbox Viewer", layout="wide")
-# Hide Streamlit header/menu/footer; tidy sidebar
 st.markdown(
     "<style>" + open("style.css", "r", encoding="utf-8").read() + "</style>",
     unsafe_allow_html=True,
@@ -85,11 +85,15 @@ def _canonicalize_feature_props(feat: dict) -> None:
             props["lot_number"] = props.get("lot", "")
         elif "lotnumber" in props:
             props["lot_number"] = props.get("lotnumber", "")
+        elif "parcel_lot_number" in props:
+            props["lot_number"] = props.get("parcel_lot_number", "")
     if "plan_value" not in props:
         if "plan" in props:
             props["plan_value"] = props.get("plan", "")
         elif "planlabel" in props:
             props["plan_value"] = props.get("planlabel", "")
+        elif "parcel_plan_number" in props:
+            props["plan_value"] = props.get("parcel_plan_number", "")
 
 
 def normalize_lotplan_input(text: str):
@@ -97,20 +101,20 @@ def normalize_lotplan_input(text: str):
     Return canonical lotplan tokens from messy input.
 
     Handles:
-      - 1/RP912949, L1 RP912949, 1 RP912949, 1RP912949
-      - '169-173, 203, 220 // DP753311' -> expands to 169..173 + singles with plan 'DP753311'
+      - 1/RP912949, L1 RP912949, 1 RP912949, 1RP912949 (QLD)
+      - '169-173, 203 // DP753311' (NSW ranges)
       - de-duplicates and strips leading zeros on lot numbers.
+
+    NOTE: SA and VIC tokens are handled separately; we no longer report them here as "ignored".
     """
     if not text:
         return []
 
     t = text.upper()
-    # Normalise common words
     t = t.replace("REGISTERED PLAN", "RP").replace("SURVEY PLAN", "SP")
     t = t.replace("CROWN PLAN A", "CPA").replace("CROWN PLAN", "CP")
     t = t.replace(" ON ", " ").replace(" OF ", " ").replace(":", " ")
 
-    # Split on semicolons/newlines into segments; each may contain // syntax
     parts = re.split(r"[;\n]+", t)
 
     def expand_range_list(numlist_str):
@@ -134,7 +138,7 @@ def normalize_lotplan_input(text: str):
         if not p:
             continue
 
-        # Case A: '169-173, 203 // DP753311'
+        # NSW '169-173, 203 // DP753311'
         m = re.search(r"(.+?)\s*//\s*([A-Z]{1,3})\s*([0-9A-Z]+)", p)
         if m:
             lots = expand_range_list(m.group(1))
@@ -142,25 +146,25 @@ def normalize_lotplan_input(text: str):
             out.extend([f"{n}{plan}" for n in lots])
             continue
 
-        # Case B: '1/RP912949' or '1 RP912949'
+        # QLD '1/RP912949' or '1 RP912949'
         m = re.match(r"^([0-9]+)\s*[\/ ]\s*([A-Z]{1,3})\s*([0-9A-Z]+)$", p)
         if m:
             out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
             continue
 
-        # Case C: 'L1 RP912949' or 'L1RP912949'
+        # QLD 'L1 RP912949' or 'L1RP912949'
         m = re.match(r"^L?\s*([0-9]+)\s*([A-Z]{1,3})\s*([0-9A-Z]+)$", p)
         if m:
             out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
             continue
 
-        # Case D: already canonical '1RP912949'
+        # Already canonical '1RP912949'
         m = re.match(r"^([0-9]+)([A-Z]{1,3})([0-9A-Z]+)$", p)
         if m:
             out.append(p)
             continue
 
-        st.info(f"Ignored unrecognized token: {p}")
+        # Do nothing for SA/VIC here; they are handled separately.
 
     # De-duplicate + strip leading zeros on lot numbers
     clean = []
@@ -180,7 +184,6 @@ def normalize_lotplan_input(text: str):
 
 QLD_FEATURESERVER = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer/4/query"
 NSW_FEATURESERVER = "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query"
-SA_FEATURESERVER = "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query"
 
 
 def _safe_request(url: str, params: dict) -> dict:
@@ -193,27 +196,34 @@ def _safe_request(url: str, params: dict) -> dict:
         return {"type": "FeatureCollection", "features": []}
 
 
-def _run_sa_query(raw_text: str) -> dict:
-    """Query the South Australia parcels layer using plan/parcel tokens."""
-    return search_sa(raw_text)
-
-
 def run_lotplan_query(raw_text: str) -> dict:
     """
-    Normalise input, route QLD vs NSW, and return a GeoJSON FeatureCollection.
-    QLD normalised tokens look like '1RP912949'; NSW will typically be entered using //DP syntax.
+    Route QLD/NSW via normaliser; always attempt SA & VIC on the raw text too.
+    Returns a GeoJSON FeatureCollection.
     """
-    tokens = normalize_lotplan_input(raw_text)
-    if not tokens:
-        return {"type": "FeatureCollection", "features": []}
+    features = []
 
-    # Separate likely NSW by plan prefixes (DP/SP) – those won't return from the QLD endpoint
+    # Always try SA and VIC on the raw text (these use different token formats)
+    try:
+        sa_gj = search_sa(raw_text)
+        features.extend(sa_gj.get("features", []))
+    except Exception:
+        pass
+
+    try:
+        vic_gj = search_vic(raw_text)
+        features.extend(vic_gj.get("features", []))
+    except Exception:
+        pass
+
+    # QLD/NSW via normaliser
+    tokens = normalize_lotplan_input(raw_text)
+
+    # Separate likely NSW by plan prefixes (DP/SP)
     qld_tokens = [lp for lp in tokens if not (lp.startswith("DP") or lp.startswith("SP"))]
     nsw_reported = [lp for lp in tokens if (lp.startswith("DP") or lp.startswith("SP"))]
     if nsw_reported:
         st.warning("Detected NSW DP/SP plans; routing those to NSW cadastre.")
-
-    features = []
 
     # QLD: lotplan IN (...) primary, fallback to lot/plan
     if qld_tokens:
@@ -234,10 +244,8 @@ def run_lotplan_query(raw_text: str) -> dict:
             gj = _safe_request(QLD_FEATURESERVER, params)
             features.extend(gj.get("features", []))
 
-    # NSW: for entries like "169-173 // DP753311" normaliser produced 169DP753311, etc.
-    # We query by lotnumber + plannumber (section optional).
+    # NSW: query by lotnumber + plannumber (section optional)
     for lp in nsw_reported:
-        # If the user typed just "//DPxxxx" with ranges it got expanded to '169DPxxxx'; split
         m = re.match(r"^([0-9]+)(DP|SP)([0-9A-Z]+)$", lp)
         if not m:
             continue
@@ -253,22 +261,14 @@ def run_lotplan_query(raw_text: str) -> dict:
         gj = _safe_request(NSW_FEATURESERVER, params)
         features.extend(gj.get("features", []))
 
-    # South Australia: broad search on provided text
-    sa_gj = _run_sa_query(raw_text)
-    features.extend(sa_gj.get("features", []))
-
-    st.info(f"Queried {len(tokens)} token(s); returned {len(features)} feature(s).")
+    st.info(f"Queried input; returned {len(features)} feature(s).")
     return {"type": "FeatureCollection", "features": features}
 
 
-
-
 def _approx_zoom_from_bbox(minx, miny, maxx, maxy):
-    """Very rough zoom estimate for WebMercator; good enough for auto-fit."""
     span_lon = max(1e-6, maxx - minx)
     span_lat = max(1e-6, maxy - miny)
     span = max(span_lon, span_lat)
-    # crude mapping: world ~360 deg -> z ~1; 0.01 deg -> ~15
     import math
     z = max(3.0, min(16.0, 1.0 + 8.0 - math.log(span, 2)))  # clamp
     return float(z)
@@ -282,12 +282,12 @@ st.sidebar.caption("Search for Lot/Plan polygons and manage downloads.")
 
 with st.sidebar.expander("Query (Lot/Plan search)", expanded=True):
     lotplan = st.text_area(
-        "Enter Lot/Plan (supports comma/range syntax):",
-        placeholder="e.g. 169-173, 203 // DP753311 or 1RP912949",
+        "Enter Lot/Plan (supports QLD/NSW syntax; SA/VIC also supported):",
+        placeholder="e.g. 169-173, 203 // DP753311 | 1RP912949 | D10000A1 | 24PS601720",
         height=100,
     )
     q_run = st.button("Run Query", type="primary", use_container_width=True)
-    st.caption("The query returns a **GeoJSON FeatureCollection**.")
+    st.caption("Returns a **GeoJSON FeatureCollection**")
 
 if "query_fc" not in st.session_state:
     st.session_state["query_fc"] = {"type": "FeatureCollection", "features": []}
@@ -310,17 +310,13 @@ with st.sidebar.expander("Layers on map", expanded=True):
         col1, col2 = st.columns([1, 1])
         col1.write("QueryResults")
         if col2.button("Remove", key="remove_query_layer"):
-            st.session_state["query_fc"] = {
-                "type": "FeatureCollection",
-                "features": [],
-            }
+            st.session_state["query_fc"] = {"type": "FeatureCollection", "features": []}
             st.experimental_rerun()
     else:
         st.write("No layers")
 
-
 # --------------------------------------------------------------------------------------
-# Export / Download
+# Export / Download (region detection improved for SA/VIC)
 # --------------------------------------------------------------------------------------
 with st.sidebar.expander("Export / Download", expanded=False):
     folder_name = st.text_input("Folder name", value="QueryResults")
@@ -332,7 +328,15 @@ with st.sidebar.expander("Export / Download", expanded=False):
     for f in features:
         _canonicalize_feature_props(f)
     if features:
-        region = "NSW" if any("planlabel" in (f.get("properties") or {}) for f in features) else "QLD"
+        # Detect region by fields present
+        region = "QLD"
+        if any("planlabel" in (f.get("properties") or {}) for f in features):
+            region = "NSW"
+        elif any("plan_t" in (f.get("properties") or {}) for f in features):
+            region = "SA"
+        elif any("parcel_plan_number" in (f.get("properties") or {}) for f in features):
+            region = "VIC"
+
         kml_str = kml_utils.generate_kml(
             features,
             region,
@@ -361,10 +365,9 @@ with st.sidebar.expander("Export / Download", expanded=False):
         except RuntimeError as e:
             st.warning(str(e))
 
-
-# ---------------------------------------------------------------------------
-# Mapbox map render (auto-zoom when query results available)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Map render
+# --------------------------------------------------------------------------------------
 features = st.session_state.get("query_fc", {}).get("features", [])
 for f in features:
     _canonicalize_feature_props(f)
@@ -376,35 +379,33 @@ if features:
     if bbox:
         minx, miny, maxx, maxy = bbox
         view_state.longitude = (minx + maxx) / 2.0
-        view_state.latitude = (miny + maxy) / 2.0
-        view_state.zoom = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
+        view_state.latitude  = (miny + maxy) / 2.0
+        view_state.zoom      = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
 
-layer = pdk.Layer(
+layer_query = pdk.Layer(
     "GeoJsonLayer",
     st.session_state.get("query_fc", {}),
-    get_fill_color=[0, 170, 255, 77],
-    get_line_color=[0, 0, 0, 255],
-    get_line_width=2,
     pickable=True,
+    stroked=True,
+    filled=True,
+    extruded=False,
+    wireframe=False,
+    get_fill_color=[0, 170, 255, 80],
+    get_line_color=[0, 0, 0, 200],
+    get_line_width=2,
 )
 
 tooltip = {
-    "html": (
-        "<table>"
-        "<tr><td><b>Lot/Plan</b></td><td>{properties.lotplan}</td></tr>"
-        "<tr><td>Lot Number</td><td>{properties.lot_number}</td></tr>"
-        "<tr><td>Plan</td><td>{properties.plan_value}</td></tr>"
-        "</table>"
-    ),
-    "style": {"font-size": "12px", "color": "white"},
+    "html": "<b>Lot</b> {{properties.lot_number}}<br/>"
+            "<b>Plan</b> {{properties.plan_value}}",
+    "style": {"color": "white"},
 }
 
-r = pdk.Deck(
-    layers=[layer],
-    initial_view_state=view_state,
-    map_style="mapbox://styles/mapbox/satellite-v9",
-    map_provider="mapbox",
-    api_keys={"mapbox": mapbox_token},
-    tooltip=tooltip,
+st.pydeck_chart(
+    pdk.Deck(
+        map_style="mapbox://styles/mapbox/satellite-v9" if mapbox_token else None,
+        initial_view_state=view_state,
+        layers=[layer_query],
+        tooltip=tooltip,
+    )
 )
-st.pydeck_chart(r, use_container_width=True)
