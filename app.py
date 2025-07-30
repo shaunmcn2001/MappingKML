@@ -274,7 +274,14 @@ if q_run and lotplan.strip():
 
 with st.sidebar.expander("Layers on map", expanded=True):
     if st.session_state.get("query_fc", {}).get("features"):
-        st.write("QueryResults")
+        col1, col2 = st.columns([1, 1])
+        col1.write("QueryResults")
+        if col2.button("Remove", key="remove_query_layer"):
+            st.session_state["query_fc"] = {
+                "type": "FeatureCollection",
+                "features": [],
+            }
+            st.experimental_rerun()
     else:
         st.write("No layers")
 
