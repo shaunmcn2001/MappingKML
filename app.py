@@ -329,6 +329,7 @@ r = pdk.Deck(
     layers=[layer],
     initial_view_state=view_state,
     map_style="mapbox://styles/mapbox/satellite-v9",
-    mapbox_key=mapbox_token,
+    map_provider="mapbox",
+    api_keys={"mapbox": mapbox_token},
 )
 st.pydeck_chart(r, use_container_width=True)
