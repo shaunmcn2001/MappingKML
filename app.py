@@ -1,28 +1,19 @@
-import json
-from io import BytesIO
 import re
 import itertools
-import copy
 from math import inf
 import os
-import zipfile
 
 import streamlit as st
-from keplergl import KeplerGl
-from streamlit_keplergl import keplergl_static
-from shapely.geometry import mapping as shp_mapping
-from fastkml import kml
-import pandas as pd
+import pydeck as pdk
 import requests
 
-from kepler_config import BASE_CONFIG
 import kml_utils
 
 
 # --------------------------------------------------------------------------------------
 # Page + CSS
 # --------------------------------------------------------------------------------------
-st.set_page_config(page_title="MappingKML — Kepler Layout + Query", layout="wide")
+st.set_page_config(page_title="MappingKML — Mapbox Viewer", layout="wide")
 # Hide Streamlit header/menu/footer; tidy sidebar
 st.markdown(
     "<style>" + open("style.css", "r", encoding="utf-8").read() + "</style>",
@@ -239,45 +230,6 @@ def run_lotplan_query(raw_text: str) -> dict:
     return {"type": "FeatureCollection", "features": features}
 
 
-def kml_to_featurecollection_from_bytes(kbytes: bytes) -> dict:
-    """Parse KML/KMZ bytes to a GeoJSON FeatureCollection (polygons only are rendered)."""
-    # KMZ support
-    if zipfile.is_zipfile(BytesIO(kbytes)):
-        with zipfile.ZipFile(BytesIO(kbytes)) as z:
-            # pick the first .kml entry
-            kml_name = next((n for n in z.namelist() if n.lower().endswith(".kml")), None)
-            if not kml_name:
-                return {"type": "FeatureCollection", "features": []}
-            kbytes = z.read(kml_name)
-
-    kdoc = kml.KML()
-    kdoc.from_string(kbytes)
-
-    def collect(node):
-        geoms = []
-        if hasattr(node, "geometry") and node.geometry is not None:
-            geoms.append(node.geometry)
-        if hasattr(node, "features") and node.features() is not None:
-            for f in node.features():
-                geoms.extend(collect(f))
-        return geoms
-
-    features = []
-    for f in getattr(kdoc, "features")() or []:
-        for g in collect(f):
-            try:
-                features.append({"type": "Feature", "geometry": shp_mapping(g), "properties": {}})
-            except Exception:
-                pass
-
-    if not features:
-        for g in collect(kdoc):
-            try:
-                features.append({"type": "Feature", "geometry": shp_mapping(g), "properties": {}})
-            except Exception:
-                pass
-
-    return {"type": "FeatureCollection", "features": features}
 
 
 def _approx_zoom_from_bbox(minx, miny, maxx, maxy):
@@ -306,132 +258,77 @@ with st.sidebar.expander("Query (Lot/Plan search)", expanded=True):
     q_run = st.button("Run Query", type="primary", use_container_width=True)
     st.caption("The query returns a **GeoJSON FeatureCollection**.")
 
-with st.sidebar.expander("Add Data (KML/KMZ Upload)", expanded=False):
-    kml_file = st.file_uploader("Upload .kml or .kmz", type=["kml", "kmz"])
-    st.caption("Uploaded polygons/lines/points render as a new dataset.")
+if "query_fc" not in st.session_state:
+    st.session_state["query_fc"] = {"type": "FeatureCollection", "features": []}
 
-with st.sidebar.expander("Datasets on map", expanded=True):
-    ds_query_name = st.text_input("Query dataset name", value="QueryResults")
-    ds_kml_name = st.text_input("KML dataset name", value="KMLUpload")
-    # *** Moved remove control into the SIDEBAR (as requested) ***
-    remove_key = None
-    if "datasets" in st.session_state and st.session_state["datasets"]:
-        remove_key = st.selectbox("Remove dataset", ["—"] + list(st.session_state["datasets"].keys()))
-        if remove_key and remove_key != "—":
-            if st.button("Remove selected", use_container_width=True):
-                st.session_state["datasets"].pop(remove_key, None)
-                st.success(f"Removed: {remove_key}")
-                # mark that we should re-fit to remaining data
-                st.session_state["__refit__"] = True
-
-
-# Hold datasets in session
-if "datasets" not in st.session_state:
-    st.session_state["datasets"] = {}  # name -> FeatureCollection
-
-# Run query
 if q_run and lotplan.strip():
     try:
         fc = run_lotplan_query(lotplan.strip())
         if not isinstance(fc, dict) or fc.get("type") != "FeatureCollection":
             st.sidebar.error("The query must return a GeoJSON FeatureCollection dict.")
         else:
-            st.session_state["datasets"][ds_query_name] = fc
-            st.success(f"Added: {ds_query_name} ({len(fc.get('features', []))} features)")
-            st.info(f"Datasets now: {', '.join(st.session_state['datasets'].keys())}")
-            st.session_state["__refit__"] = True  # *** trigger auto-zoom ***
+            st.session_state["query_fc"] = fc
+            st.success(f"Found {len(fc.get('features', []))} feature(s)")
     except Exception as e:
         st.sidebar.error(f"Query error: {e}")
 
-# Handle KML/KMZ upload
-if kml_file is not None:
-    try:
-        file_bytes = kml_file.getvalue()  # robust for Streamlit's uploader
-        fc_kml = kml_to_featurecollection_from_bytes(file_bytes)
-        st.session_state["datasets"][ds_kml_name] = fc_kml
-        st.sidebar.success(f"Added: {ds_kml_name} ({len(fc_kml.get('features', []))} features)")
-        st.session_state["__refit__"] = True  # *** trigger auto-zoom ***
-    except Exception as e:
-        st.sidebar.error(f"KML/KMZ parse error: {e}")
+with st.sidebar.expander("Layers on map", expanded=True):
+    if st.session_state.get("query_fc", {}).get("features"):
+        st.write("QueryResults")
+    else:
+        st.write("No layers")
+
 
 # --------------------------------------------------------------------------------------
 # Export / Download
 # --------------------------------------------------------------------------------------
 with st.sidebar.expander("Export / Download", expanded=False):
-    selected_ds = st.selectbox(
-        "Select dataset to export",
-        list(st.session_state["datasets"].keys()) if st.session_state["datasets"] else [],
-    )
-    region = st.selectbox("Region (attribute schema)", ["QLD", "NSW"])
+    folder_name = st.text_input("Folder name", value="QueryResults")
     fill_hex = st.text_input("Fill colour (hex)", "#00AAFF")
     fill_opacity = st.slider("Fill opacity", 0.0, 1.0, 0.3, 0.05)
     outline_hex = st.text_input("Outline colour (hex)", "#000000")
     outline_weight = st.number_input("Outline width (px)", 1, 10, 2)
-    if selected_ds:
-        feats = st.session_state["datasets"][selected_ds].get("features", [])
-        kml_str = kml_utils.generate_kml(feats, region, fill_hex, fill_opacity, outline_hex, outline_weight, selected_ds)
+    features = st.session_state.get("query_fc", {}).get("features", [])
+    if features:
+        region = "NSW" if any("planlabel" in (f.get("properties") or {}) for f in features) else "QLD"
+        kml_str = kml_utils.generate_kml(features, region, fill_hex, fill_opacity, outline_hex, outline_weight, folder_name)
         st.download_button(
             "Download KML",
             data=kml_str.encode("utf-8"),
-            file_name=f"{selected_ds}.kml",
+            file_name=f"{folder_name}.kml",
             mime="application/vnd.google-earth.kml+xml",
             use_container_width=True,
         )
-        try:
-            shp_bytes = kml_utils.generate_shapefile(feats, region)
-            st.download_button(
-                "Download Shapefile (.zip)",
-                data=shp_bytes,
-                file_name=f"{selected_ds}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-        except RuntimeError as e:
-            st.warning(f"Shapefile export unavailable: {e}")
 
 
-# --------------------------------------------------------------------------------------
-# Kepler map render (auto-zoom + satellite default + safe fallback)
-# --------------------------------------------------------------------------------------
-data_bundle = {name: fc for name, fc in st.session_state.get("datasets", {}).items()}
+# ---------------------------------------------------------------------------
+# Mapbox map render (auto-zoom when query results available)
+# ---------------------------------------------------------------------------
+features = st.session_state.get("query_fc", {}).get("features", [])
 
-cfg = copy.deepcopy(BASE_CONFIG)
-if "config" in cfg and "visState" in cfg["config"]:
-    cfg["config"]["visState"].pop("layers", None)
-
-# Auto-center after add/remove
-if data_bundle and st.session_state.get("__refit__", False):
-    bbox = compute_bbox_of_featurecollections(data_bundle)
-    if bbox and "config" in cfg and "mapState" in cfg["config"]:
-        minx, miny, maxx, maxy = bbox
-        cfg["config"]["mapState"]["longitude"] = (minx + maxx) / 2.0
-        cfg["config"]["mapState"]["latitude"]  = (miny + maxy) / 2.0
-        cfg["config"]["mapState"]["zoom"]      = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
-    st.session_state["__refit__"] = False
-
-# Mapbox token from secrets or env
 mapbox_token = st.secrets.get("MAPBOX_API_KEY") or os.getenv("MAPBOX_API_KEY")
+view_state = pdk.ViewState(latitude=-27.5, longitude=153.0, zoom=7)
+if features:
+    bbox = compute_bbox_of_featurecollections({"query": st.session_state["query_fc"]})
+    if bbox:
+        minx, miny, maxx, maxy = bbox
+        view_state.longitude = (minx + maxx) / 2.0
+        view_state.latitude = (miny + maxy) / 2.0
+        view_state.zoom = _approx_zoom_from_bbox(minx, miny, maxx, maxy)
 
-# If no token but satellite requested, fallback to dark to avoid blank tiles
-try:
-    if cfg["config"]["mapStyle"].get("styleType") == "satellite" and not mapbox_token:
-        cfg["config"]["mapStyle"]["styleType"] = "dark"
-        st.warning("No MAPBOX_API_KEY found; switched basemap to 'dark' as a fallback.")
-except Exception:
-    pass
-
-# IMPORTANT: do NOT inject custom mapStyles, and do NOT pass `data=` here.
-m = KeplerGl(
-    height=800,
-    config=cfg if cfg else None,
-    mapbox_api_key=mapbox_token  # Kepler will request Satellite if styleType='satellite'
+layer = pdk.Layer(
+    "GeoJsonLayer",
+    st.session_state.get("query_fc", {}),
+    get_fill_color=[0, 170, 255, 77],
+    get_line_color=[0, 0, 0, 255],
+    get_line_width=2,
+    pickable=True,
 )
 
-# Add datasets AFTER construction to avoid trait validation issues
-for name, fc in data_bundle.items():
-    try:
-        m.add_data(data=fc, name=name)
-    except Exception as e:
-        st.warning(f"Failed to add dataset '{name}': {e}")
-
-keplergl_static(m)
+r = pdk.Deck(
+    layers=[layer],
+    initial_view_state=view_state,
+    map_style="mapbox://styles/mapbox/satellite-v9",
+    mapbox_key=mapbox_token,
+)
+st.pydeck_chart(r, use_container_width=True)

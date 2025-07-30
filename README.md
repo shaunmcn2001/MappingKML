@@ -1,6 +1,6 @@
-# MappingKML — Streamlit + Kepler.gl layout with Query bar
+# MappingKML — Streamlit Mapbox Viewer
 
-This app keeps Streamlit and embeds **Kepler.gl** (`streamlit-keplergl`) to replicate the classic Kepler left panel (Layers/Filters/Interactions) and adds a **separate Query bar** (Streamlit sidebar) that drives the datasets shown on the map.
+This version uses **Mapbox** via `pydeck` to display query results on an interactive map. The sidebar provides a Lot/Plan search bar and simple export options.
 
 ## Install & Run
 ```bash
@@ -11,12 +11,9 @@ streamlit run app.py
 Using the Query bar
 •Paste your Lot/Plan pattern (e.g., 169-173, 203, 220, 246, 329//DP753311 or 1RP912949).
 •Wire your existing ArcGIS/Qld cadastral query inside run_lotplan_query() to return a GeoJSON FeatureCollection (polygons preferred).
-•Upload KML files to add more polygon/line/point datasets.
-
 Notes
-•Datasets are passed to Kepler as named GeoJSON FeatureCollections.
-•kepler_config.py sets the UI layout (side panel open, dark style, SE QLD default view).
-•Adjust BASE_CONFIG to set default layers, colors, tooltips, etc.
+•Searches call `run_lotplan_query()` which should return a GeoJSON FeatureCollection.
+•Results appear on the map and can be exported as KML.
 
 ---
 
