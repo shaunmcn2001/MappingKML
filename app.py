@@ -322,7 +322,15 @@ with st.sidebar.expander("Export / Download", expanded=False):
         _canonicalize_feature_props(f)
     if features:
         region = "NSW" if any("planlabel" in (f.get("properties") or {}) for f in features) else "QLD"
-        kml_str = kml_utils.generate_kml(features, region, fill_hex, fill_opacity, outline_hex, outline_weight, folder_name)
+        kml_str = kml_utils.generate_kml(
+            features,
+            region,
+            fill_hex,
+            fill_opacity,
+            outline_hex,
+            outline_weight,
+            folder_name,
+        )
         st.download_button(
             "Download KML",
             data=kml_str.encode("utf-8"),
@@ -330,6 +338,17 @@ with st.sidebar.expander("Export / Download", expanded=False):
             mime="application/vnd.google-earth.kml+xml",
             use_container_width=True,
         )
+        try:
+            shp_bytes = kml_utils.generate_shapefile(features, region)
+            st.download_button(
+                "Download Shapefile",
+                data=shp_bytes,
+                file_name=f"{folder_name}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        except RuntimeError as e:
+            st.warning(str(e))
 
 
 # ---------------------------------------------------------------------------
