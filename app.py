@@ -6,6 +6,7 @@ import os
 import streamlit as st
 import pydeck as pdk
 import requests
+from backend.sa_query import search_sa
 
 import kml_utils
 
@@ -193,18 +194,8 @@ def _safe_request(url: str, params: dict) -> dict:
 
 
 def _run_sa_query(raw_text: str) -> dict:
-    """Query the South Australia parcels layer by parcel identifier."""
-    parcel_id = raw_text.strip().upper()
-    if not parcel_id:
-        return {"type": "FeatureCollection", "features": []}
-    params = {
-        "where": f"UPPER(PARCEL_ID)='{parcel_id}'",
-        "outFields": "*",
-        "returnGeometry": "true",
-        "outSR": "4326",
-        "f": "geojson",
-    }
-    return _safe_request(SA_FEATURESERVER, params)
+    """Query the South Australia parcels layer using plan/parcel tokens."""
+    return search_sa(raw_text)
 
 
 def run_lotplan_query(raw_text: str) -> dict:
