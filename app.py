@@ -247,7 +247,7 @@ def _approx_zoom_from_bbox(minx, miny, maxx, maxy):
 # Sidebar UI (Query + Upload + Dataset management)
 # --------------------------------------------------------------------------------------
 st.sidebar.title("Query & Data")
-st.sidebar.caption("Add a **Query** panel next to Kepler’s Layers/Filters to drive datasets rendered on the map.")
+st.sidebar.caption("Search for Lot/Plan polygons and manage downloads.")
 
 with st.sidebar.expander("Query (Lot/Plan search)", expanded=True):
     lotplan = st.text_area(
