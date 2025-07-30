@@ -83,12 +83,12 @@ def generate_kml(
         if region == "QLD":
             lot = props.get("lot", "")
             plan = props.get("plan", "")
-            placename = f"Lot {lot} Plan {plan}"
+            lotplan = props.get("lotplan") or f"{lot}{plan}"
         else:
             lot = props.get("lotnumber", "")
-            sec = props.get("sectionnumber", "") or ""
             planlabel = props.get("planlabel", "")
-            placename = f"Lot {lot} {('Section ' + sec + ' ') if sec else ''}{planlabel}"
+            lotplan = f"{lot}{planlabel}"
+        placename = lotplan
 
         # Build up ExtendedData elements.  These fields mirror those used in
         # Queensland Globe exports.  Additional metadata could be added here

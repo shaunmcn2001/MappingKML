@@ -46,7 +46,7 @@ def test_generate_kml_qld():
     root = parse_kml(result)
     ns = {"k": "http://www.opengis.net/kml/2.2"}
     name = root.find(".//k:Placemark/k:name", ns)
-    assert name is not None and name.text == "Lot 1 Plan RP12345"
+    assert name is not None and name.text == "1RP12345"
     fill = root.find(".//k:PolyStyle/k:color", ns)
     assert fill.text == kml._hex_to_kml_color("#123456", 0.3)
 
@@ -57,6 +57,6 @@ def test_generate_kml_nsw():
     root = parse_kml(result)
     ns = {"k": "http://www.opengis.net/kml/2.2"}
     name = root.find(".//k:Placemark/k:name", ns)
-    assert name is not None and name.text == "Lot 2 Section 1 DP67890"
+    assert name is not None and name.text == "2DP67890"
     fill = root.find(".//k:PolyStyle/k:color", ns)
     assert fill.text == kml._hex_to_kml_color("#abcdef", 0.8)

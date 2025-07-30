@@ -71,6 +71,26 @@ def _split_lot_plan(lotplan: str):
     return m.group(1), m.group(2)
 
 
+def _canonicalize_feature_props(feat: dict) -> None:
+    """Add common property names for tooltips."""
+    props = feat.setdefault("properties", {})
+    if "lotplan" not in props:
+        if "lot" in props and "plan" in props:
+            props["lotplan"] = f"{props.get('lot','')}{props.get('plan','')}"
+        elif "lotnumber" in props and "planlabel" in props:
+            props["lotplan"] = f"{props.get('lotnumber','')}{props.get('planlabel','')}"
+    if "lot_number" not in props:
+        if "lot" in props:
+            props["lot_number"] = props.get("lot", "")
+        elif "lotnumber" in props:
+            props["lot_number"] = props.get("lotnumber", "")
+    if "plan_value" not in props:
+        if "plan" in props:
+            props["plan_value"] = props.get("plan", "")
+        elif "planlabel" in props:
+            props["plan_value"] = props.get("planlabel", "")
+
+
 def normalize_lotplan_input(text: str):
     """
     Return canonical lotplan tokens from messy input.
@@ -267,6 +287,8 @@ if q_run and lotplan.strip():
         if not isinstance(fc, dict) or fc.get("type") != "FeatureCollection":
             st.sidebar.error("The query must return a GeoJSON FeatureCollection dict.")
         else:
+            for f in fc.get("features", []):
+                _canonicalize_feature_props(f)
             st.session_state["query_fc"] = fc
             st.success(f"Found {len(fc.get('features', []))} feature(s)")
     except Exception as e:
@@ -296,6 +318,8 @@ with st.sidebar.expander("Export / Download", expanded=False):
     outline_hex = st.text_input("Outline colour (hex)", "#000000")
     outline_weight = st.number_input("Outline width (px)", 1, 10, 2)
     features = st.session_state.get("query_fc", {}).get("features", [])
+    for f in features:
+        _canonicalize_feature_props(f)
     if features:
         region = "NSW" if any("planlabel" in (f.get("properties") or {}) for f in features) else "QLD"
         kml_str = kml_utils.generate_kml(features, region, fill_hex, fill_opacity, outline_hex, outline_weight, folder_name)
@@ -312,6 +336,8 @@ with st.sidebar.expander("Export / Download", expanded=False):
 # Mapbox map render (auto-zoom when query results available)
 # ---------------------------------------------------------------------------
 features = st.session_state.get("query_fc", {}).get("features", [])
+for f in features:
+    _canonicalize_feature_props(f)
 
 mapbox_token = st.secrets.get("MAPBOX_API_KEY") or os.getenv("MAPBOX_API_KEY")
 view_state = pdk.ViewState(latitude=-27.5, longitude=153.0, zoom=7)
@@ -332,11 +358,23 @@ layer = pdk.Layer(
     pickable=True,
 )
 
+tooltip = {
+    "html": (
+        "<table>"
+        "<tr><td><b>Lot/Plan</b></td><td>{properties.lotplan}</td></tr>"
+        "<tr><td>Lot Number</td><td>{properties.lot_number}</td></tr>"
+        "<tr><td>Plan</td><td>{properties.plan_value}</td></tr>"
+        "</table>"
+    ),
+    "style": {"font-size": "12px", "color": "white"},
+}
+
 r = pdk.Deck(
     layers=[layer],
     initial_view_state=view_state,
     map_style="mapbox://styles/mapbox/satellite-v9",
     map_provider="mapbox",
     api_keys={"mapbox": mapbox_token},
+    tooltip=tooltip,
 )
 st.pydeck_chart(r, use_container_width=True)
