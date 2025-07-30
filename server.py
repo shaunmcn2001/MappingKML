@@ -6,6 +6,8 @@ import re
 app = Flask(__name__)
 CORS(app)
 
+SA_FEATURESERVER = "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query"
+
 
 @app.route('/search', methods=['POST'])
 def search():
@@ -72,6 +74,24 @@ def search():
         for feat in data.get('features', []) or []:
             features.append(feat)
             regions.append('QLD')
+
+        # South Australia search using broad text
+        sa_params = {
+            'searchText': user_input,
+            'where': '1=1',
+            'outFields': '*',
+            'outSR': '4326',
+            'returnGeometry': 'true',
+            'f': 'geoJSON'
+        }
+        try:
+            res = requests.get(SA_FEATURESERVER, params=sa_params, timeout=10)
+            data = res.json()
+        except Exception:
+            data = {}
+        for feat in data.get('features', []) or []:
+            features.append(feat)
+            regions.append('SA')
     return jsonify({'features': features, 'regions': regions})
 
 

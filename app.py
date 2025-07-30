@@ -179,6 +179,7 @@ def normalize_lotplan_input(text: str):
 
 QLD_FEATURESERVER = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer/4/query"
 NSW_FEATURESERVER = "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query"
+SA_FEATURESERVER = "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query"
 
 
 def _safe_request(url: str, params: dict) -> dict:
@@ -189,6 +190,19 @@ def _safe_request(url: str, params: dict) -> dict:
     except Exception as e:
         st.error(f"Request failed: {e}")
         return {"type": "FeatureCollection", "features": []}
+
+
+def _run_sa_query(raw_text: str) -> dict:
+    """Query the South Australia parcels layer using a broad search."""
+    params = {
+        "searchText": raw_text,
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "f": "geojson",
+    }
+    return _safe_request(SA_FEATURESERVER, params)
 
 
 def run_lotplan_query(raw_text: str) -> dict:
@@ -245,6 +259,10 @@ def run_lotplan_query(raw_text: str) -> dict:
         }
         gj = _safe_request(NSW_FEATURESERVER, params)
         features.extend(gj.get("features", []))
+
+    # South Australia: broad search on provided text
+    sa_gj = _run_sa_query(raw_text)
+    features.extend(sa_gj.get("features", []))
 
     st.info(f"Queried {len(tokens)} token(s); returned {len(features)} feature(s).")
     return {"type": "FeatureCollection", "features": features}
