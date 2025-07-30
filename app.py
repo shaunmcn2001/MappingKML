@@ -39,7 +39,7 @@ def compute_bbox_of_featurecollections(named_fcs: dict[str, dict]):
         elif isinstance(coords, (list, tuple)):
             for c in coords:
                 walk_coords(c)
-@@ -217,221 +208,127 @@ def run_lotplan_query(raw_text: str) -> dict:
+@ -217,221 +208,127 @@ def run_lotplan_query(raw_text: str) -> dict:
             features.extend(gj.get("features", []))
 
     # NSW: for entries like "169-173 // DP753311" normaliser produced 169DP753311, etc.
