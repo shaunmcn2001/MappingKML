@@ -11,6 +11,64 @@ import os
 import zipfile
 import tempfile
 from datetime import datetime
+from typing import Dict, Any, Iterable
+
+
+def _get_first(props: Dict[str, Any], keys: Iterable[str]) -> Any:
+    """Return the first non-empty property matching any of the provided keys."""
+    for k in keys:
+        v = props.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def build_kml_feature_name(props: Dict[str, Any]) -> str:
+    """Build a human readable feature name for KML exports.
+
+    This understands both QLD and NSW attribute conventions.  NSW parcels may
+    include an optional section.  If no explicit lot/plan values are found the
+    function falls back to any ``lotplan`` attribute.
+    """
+
+    lot = _get_first(props, ["lot", "lotnumber"])
+    section = _get_first(props, ["section", "sectionnumber"])
+    plan = _get_first(props, ["plan", "planlabel"])
+    lotplan = _get_first(props, ["lotplan"])
+
+    if not any([lot, section, plan]) and lotplan:
+        return str(lotplan)
+
+    parts = []
+    if lot:
+        parts.append(f"Lot {lot}")
+    if section:
+        parts.append(f"Sec {section}")
+    if plan:
+        parts.append(str(plan).upper())
+    return " ".join(parts) if parts else "Parcel"
+
+
+def build_kml_balloon(props: Dict[str, Any]) -> str:
+    """Return an HTML table suitable for use inside a KML balloon."""
+
+    lot = _get_first(props, ["lot", "lotnumber"])
+    section = _get_first(props, ["section", "sectionnumber"])
+    plan = _get_first(props, ["plan", "planlabel"])
+
+    rows = []
+    if lot:
+        rows.append(("Lot", lot))
+    if section:
+        rows.append(("Section", section))
+    if plan:
+        rows.append(("Plan", plan))
+
+    html = ["<table>"]
+    for key, value in rows:
+        html.append(f"<tr><th>{key}</th><td>{value}</td></tr>")
+    html.append("</table>")
+    return "".join(html)
 
 
 def _hex_to_kml_color(hex_color: str, opacity: float) -> str:
@@ -300,4 +358,6 @@ __all__ = [
     "generate_kml",
     "generate_shapefile",
     "get_bounds",
+    "build_kml_feature_name",
+    "build_kml_balloon",
 ]
