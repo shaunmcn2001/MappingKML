@@ -95,54 +95,76 @@ def parse_lot_section_plan(raw: str) -> Tuple[str, Optional[str], str]:
 
 def query_nsw_lsp(user_input: str, timeout: int = 30) -> Dict[str, Any]:
     """
-    Queries NSW by lot/section/plan (section optional).
-    Returns a GeoJSON FeatureCollection in EPSG:4326.
+    Robust NSW query:
+      1) Parse lot/section/plan from user input
+      2) Query ALL parcels for the plan (planlabel) once
+      3) Filter locally by lotnumber (and sectionnumber if provided)
+    Returns GeoJSON FeatureCollection in EPSG:4326.
     """
     lot, section, planlabel = parse_lot_section_plan(user_input)
 
-    where = f"UPPER(lotnumber)=UPPER('{lot}') AND UPPER(planlabel)=UPPER('{planlabel}')"
-    params = {
-        "where": where,
+    # --- Step 1: fetch all features on the plan (server-side WHERE is simple & reliable)
+    base_params = {
+        "where": f"UPPER(planlabel)=UPPER('{planlabel}')",
         "outFields": "*",
         "outSR": 4326,
-        "f": "geojson",
         "returnGeometry": "true",
+        "f": "geojson",
     }
+    r = requests.get(NSW_FEATURESERVER_8, params=base_params, timeout=timeout)
+    try:
+        r.raise_for_status()
+    except Exception as e:
+        raise NSWQueryError(f"NSW request failed: {e}")
 
-    r = requests.get(NSW_FEATURESERVER_8, params=params, timeout=timeout)
-    r.raise_for_status()
     data = r.json()
-    feats: List[Dict[str, Any]] = data.get("features", [])
+    feats = data.get("features", [])
 
     if not feats:
+        # Extra helpful context for your UI
         raise NSWQueryError(
-            f"No NSW parcels for lot '{lot}' and plan '{planlabel}'. "
-            "Confirm the plan is NSW (DP/SP/etc.) and that the lot exists on that plan."
+            f"No NSW parcels for plan '{planlabel}'. "
+            f"Confirm the plan exists and is a NSW DP/SP/CP."
+        )
+
+    # --- Step 2: filter by lot (and optional section) client-side
+    def _props(feat):
+        return feat.get("properties") or feat.get("attributes") or {}
+
+    lot_filtered = [f for f in feats if str(_props(f).get("lotnumber", "")).strip().upper() == str(lot).strip().upper()]
+
+    if not lot_filtered:
+        # Show available lots on this plan to guide the user
+        lots_available = sorted({str(_props(f).get("lotnumber", "")).strip() for f in feats if _props(f).get("lotnumber") is not None})
+        raise NSWQueryError(
+            f"No lot '{lot}' found on plan '{planlabel}'. "
+            f"Lots on this plan include: {', '.join(lots_available) if lots_available else 'n/a'}."
         )
 
     if section is None:
-        return data
+        return {"type": "FeatureCollection", "features": lot_filtered}
 
-    # Filter section client-side across common keys
-    def _sec_match(props: Dict[str, Any]) -> bool:
+    # Filter by section across common keys; NSW generally uses 'sectionnumber'
+    SECTION_KEYS = ["sectionnumber", "section", "sec", "section_no", "sect_no", "section_num"]
+    def _section_match(props):
+        target = str(section).strip().upper()
         for k in SECTION_KEYS:
             if k in props and props[k] is not None:
-                if str(props[k]).strip().upper() == str(section).strip().upper():
+                if str(props[k]).strip().upper() == target:
                     return True
         return False
 
-    filtered = [
-        f for f in feats
-        if _sec_match(f.get("properties") or f.get("attributes") or {})
-    ]
-    if not filtered:
+    final = [f for f in lot_filtered if _section_match(_props(f))]
+
+    if not final:
         return {
             "type": "FeatureCollection",
             "features": [],
             "note": (
-                f"Found {len(feats)} feature(s) for Lot {lot} {planlabel}, "
-                f"but none matched section '{section}'. If there is no section, try 'lot//plan'."
+                f"Found {len(lot_filtered)} feature(s) for Lot {lot} on {planlabel}, "
+                f"but none matched section '{section}'. If there is no section, use 'lot//plan'."
             ),
         }
 
-    return {"type": "FeatureCollection", "features": filtered}
+    return {"type": "FeatureCollection", "features": final}
+
