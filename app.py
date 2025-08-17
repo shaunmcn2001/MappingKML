@@ -1,10 +1,8 @@
-# app.py — MappingKML (NSW ONLY lotidstring on layer 9; QLD + SA supported)
-# --------------------------------------------------------------------------------------
-# NSW: input lotidstring like 13//DP1246224 (we query layer 9 field 'lotidstring' ONLY)
-# QLD: lot/plan formats (13/DP1242624, 77//DP753955, 3SP181800, Lot 3 on Survey Plan 181800)
-# SA:  planparcel like D10001AL12  OR title search "folio/volume" or "volume/folio" (e.g., 1234/5678)
-# Exports: GeoJSON / KML / KMZ — KML balloons list ALL attributes
-# --------------------------------------------------------------------------------------
+# app.py — MappingKML
+# NSW: layer 9, search ONLY by lotidstring (e.g., 13//DP1246224)
+# QLD: lot + plan
+# SA : planparcel or title (volume/folio in any order)
+# Exports: GeoJSON, KML, KMZ (Google Earth balloons show ALL attributes)
 
 import io
 import json
@@ -18,41 +16,33 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
-# Optional: enable KML/KMZ export if simplekml is installed
+# Optional KML export
 try:
     import simplekml
     HAVE_SIMPLEKML = True
 except Exception:
     HAVE_SIMPLEKML = False
 
-# -------------------------- App config --------------------------
+# --------------------- App Config ---------------------
 
 st.set_page_config(page_title="MappingKML", layout="wide")
 
 ENDPOINTS = {
-    # QLD Cadastre (adjust if your layer differs)
     "QLD": "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Cadastre/LandParcels/MapServer/0/query",
-
-    # NSW Cadastre — use MapServer/9 (Lot layer); we query by 'lotidstring' ONLY
+    # NSW pinned to layer 9 (Lot)
     "NSW": "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query",
-
-    # SA Cadastre (Reference_WFL1 FeatureServer, Layer 1)
     "SA":  "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
 }
 
 DEFAULT_VIEW = pdk.ViewState(latitude=-32.0, longitude=147.0, zoom=5.0, pitch=0, bearing=0)
 
-# Plan-type hints (used only for rookie warnings)
-NSW_PLAN_TYPES = {"DP", "SP", "SC", "CP", "DPX"}
-QLD_PLAN_TYPES = {"SP", "RP", "CP", "BUP", "GTP", "PC", "SL", "CSP"}
+# Request tuning (keep the app responsive)
+REQUEST_TIMEOUT = 12
+REQUEST_RETRIES = 0
 
-# Request tuning
-REQUEST_TIMEOUT = 45  # seconds
-REQUEST_RETRIES = 2
+# --------------------- Geometry Helpers ---------------------
 
-# -------------------------- Geo helpers --------------------------
-
-def _as_feature_collection(fc_like):
+def _as_fc(fc_like):
     if fc_like is None:
         return None
     if isinstance(fc_like, str):
@@ -102,10 +92,8 @@ def _geom_bbox(geom):
         if not (isinstance(lng, (int, float)) and isinstance(lat, (int, float))):
             continue
         found = True
-        if lng < min_lng: min_lng = lng
-        if lng > max_lng: max_lng = lng
-        if lat < min_lat: min_lat = lat
-        if lat > max_lat: max_lat = lat
+        min_lng = min(min_lng, lng); max_lng = max(max_lng, lng)
+        min_lat = min(min_lat, lat); max_lat = max(max_lat, lat)
     return (min_lng, min_lat, max_lng, max_lat) if found else None
 
 def _merge_bbox(b1, b2):
@@ -126,72 +114,68 @@ def _bbox_to_viewstate(bbox, padding_ratio=0.12):
     extent = max(max_lng - min_lng, max_lat - min_lat)
     if extent <= 0 or not math.isfinite(extent):
         return pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=14)
-    if extent > 20:      zoom = 5
-    elif extent > 10:    zoom = 6
-    elif extent > 5:     zoom = 7
-    elif extent > 2:     zoom = 8
-    elif extent > 1:     zoom = 9
-    elif extent > 0.5:   zoom = 10
-    elif extent > 0.25:  zoom = 11
-    elif extent > 0.1:   zoom = 12
-    else:                zoom = 13
+    if extent > 20: zoom = 5
+    elif extent > 10: zoom = 6
+    elif extent > 5: zoom = 7
+    elif extent > 2: zoom = 8
+    elif extent > 1: zoom = 9
+    elif extent > 0.5: zoom = 10
+    elif extent > 0.25: zoom = 11
+    elif extent > 0.1: zoom = 12
+    else: zoom = 13
     return pdk.ViewState(latitude=center_lat, longitude=center_lng, zoom=zoom)
 
-def _fit_view(fc_like, warn_if_empty=True):
-    fc = _as_feature_collection(fc_like)
+def _fit_view(fc_like):
+    fc = _as_fc(fc_like)
     if not fc or not fc.get("features"):
-        if warn_if_empty:
-            st.warning("No features to display. Showing default view.", icon="⚠️")
+        st.warning("No features to display. Showing default view.", icon="⚠️")
         return DEFAULT_VIEW
     bbox = None
     for feat in fc["features"]:
         b = _geom_bbox((feat or {}).get("geometry") or {})
         bbox = _merge_bbox(bbox, b)
     if bbox is None:
-        if warn_if_empty:
-            st.warning("Features had no valid coordinates. Showing default view.", icon="⚠️")
+        st.warning("Features had no valid coordinates. Showing default view.", icon="⚠️")
         return DEFAULT_VIEW
-    return _bbox_to_viewstate(bbox, padding_ratio=0.12)
+    return _bbox_to_viewstate(bbox)
 
-# -------------------------- Input parsing (SAFE) --------------------------
+# --------------------- Parsing ---------------------
 
-# NSW: lotidstring like 13//DP1246224
+# NSW lotidstring only (also accept 13/DP1246224 and normalize to 13//DP1246224)
 RE_NSW_LOTID = re.compile(r"^\s*(?P<lotid>\d+//[A-Za-z]{1,6}\d+)\s*$")
+RE_NSW_ONE_SLASH = re.compile(r"^\s*(?P<lot>\d+)\s*/\s*(?P<plan>[A-Za-z]{1,6}\d+)\s*$")
 
-# QLD generic styles
+# QLD
 RE_LOTPLAN_SLASH = re.compile(
     r"^\s*(?P<lot>\d+)\s*(?:/(?P<section>\d+))?\s*/\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$"
 )
-RE_COMPACT = re.compile(
-    r"^\s*(?P<lot>\d+)\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$"
-)
+RE_COMPACT = re.compile(r"^\s*(?P<lot>\d+)\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$")
 RE_VERBOSE = re.compile(
     r"^\s*Lot\s+(?P<lot>\d+)\s+on\s+(?P<plan_label>(Registered|Survey)\s+Plan)\s+(?P<plan_number>\d+)\s*$",
     re.IGNORECASE
 )
 
-# SA patterns
+# SA
 RE_SA_PLANPARCEL = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
 RE_SA_TITLEPAIR  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
 
+def _nsw_normalize_lotid(raw: str) -> str:
+    s = (raw or "").strip().upper().replace(" ", "")
+    if "//" in s:
+        return s
+    m = RE_NSW_ONE_SLASH.match(s)
+    return f"{m.group('lot')}//{m.group('plan')}" if m else s
+
 def parse_queries(multiline: str) -> List[Dict]:
-    """
-    Return a list of parsed query dicts.
-    - NSW: prefer nsw_lotid (13//DP1246224)
-    - QLD: lot/plan formats
-    - SA:  planparcel OR title pair (folio/volume) any order
-    """
     items: List[Dict] = []
     lines = [x.strip() for x in (multiline or "").splitlines() if x.strip()]
-
     for raw in lines:
-        # NSW lotidstring (do this first so NSW users don't need special syntax)
-        m = RE_NSW_LOTID.match(raw)
+        m = RE_NSW_LOTID.match(raw) or RE_NSW_ONE_SLASH.match(raw)
         if m:
-            items.append({"raw": raw, "nsw_lotid": m.group("lotid").upper()})
+            lotid = _nsw_normalize_lotid(raw)
+            items.append({"raw": raw, "nsw_lotid": lotid})
             continue
 
-        # QLD like 13/1/DP1242624 or 13/DP1242624
         m = RE_LOTPLAN_SLASH.match(raw)
         if m:
             items.append({
@@ -203,7 +187,6 @@ def parse_queries(multiline: str) -> List[Dict]:
             })
             continue
 
-        # Compact like 3SP181800
         m = RE_COMPACT.match(raw)
         if m:
             items.append({
@@ -215,7 +198,6 @@ def parse_queries(multiline: str) -> List[Dict]:
             })
             continue
 
-        # Verbose like "Lot 3 on Survey Plan 181800"
         m = RE_VERBOSE.match(raw)
         if m:
             plan_type = "SP" if "Survey" in (m.group("plan_label") or "") else "RP"
@@ -228,49 +210,45 @@ def parse_queries(multiline: str) -> List[Dict]:
             })
             continue
 
-        # SA planparcel, e.g., D10001AL12
         m = RE_SA_PLANPARCEL.match(raw)
         if m:
             items.append({"raw": raw, "sa_planparcel": m.group("planparcel").upper()})
             continue
 
-        # SA title pair (folio/volume OR volume/folio), e.g., 1234/5678
         m = RE_SA_TITLEPAIR.match(raw)
         if m:
             a, b = m.group("a"), m.group("b")
             items.append({"raw": raw, "sa_titlepair": (a, b)})
             continue
 
-        # Nothing matched
         items.append({"raw": raw, "unparsed": True})
     return items
 
-# -------------------------- HTTP (retry) --------------------------
+# --------------------- HTTP / ArcGIS ---------------------
 
 def _http_get_json(url: str, params: Dict, retries: int = REQUEST_RETRIES, timeout: int = REQUEST_TIMEOUT) -> Dict:
     last_err = None
     for attempt in range(retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            base = dict(
+                f="json",
+                outSR=4326,
+                returnGeometry="true",
+                geometryPrecision=6,
+                returnExceededLimitFeatures="false",
+            )
+            merged = {**base, **params}
+            r = requests.get(url, params=merged, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_err = e
             if attempt < retries:
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(0.5)
     raise last_err if last_err else RuntimeError("Unknown request error")
 
 def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
-    params = {
-        "f": "json",
-        "where": where,
-        "outFields": out_fields,
-        "outSR": 4326,
-        "returnGeometry": "true",
-        # keep payloads tight-ish
-        "geometryPrecision": 6,
-        "returnExceededLimitFeatures": "false",
-    }
+    params = {"where": where, "outFields": out_fields}
     data = _http_get_json(url, params)
     features = []
     for g in data.get("features", []):
@@ -279,9 +257,7 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
         if not geom:
             continue
         if "rings" in geom:
-            coords = []
-            for ring in geom["rings"]:
-                coords.append(ring)
+            coords = [ring for ring in geom["rings"]]
             geo = {"type": "Polygon", "coordinates": coords}
         elif "paths" in geom:
             geo = {"type": "MultiLineString", "coordinates": geom["paths"]}
@@ -292,30 +268,13 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
         features.append({"type": "Feature", "geometry": geo, "properties": attrs})
     return {"type": "FeatureCollection", "features": features}
 
-# -------------------------- NSW helpers (lotidstring ONLY) --------------------------
-
-def _nsw_normalize_lotid(raw: str) -> str:
-    """
-    Accepts '13//DP1246224', '13/DP1246224', '13 / DP1246224' and returns '13//DP1246224'.
-    """
-    s = (raw or "").strip().upper().replace(" ", "")
-    if "//" in s:
-        return s
-    m = re.match(r"^(?P<lot>\d+)/(?P<plan>[A-Z]{1,6}\d+)$", s)
-    return f"{m.group('lot')}//{m.group('plan')}" if m else s
+# --------------------- Fetchers ---------------------
 
 def fetch_nsw_by_lotid(lotid: str) -> Dict:
-    """
-    NSW strict search against layer 9:
-    - ONLY exact lotidstring (case-insensitive)
-    - No plan-only or other fallbacks
-    """
     url = ENDPOINTS["NSW"]
     lotid_norm = _nsw_normalize_lotid(lotid)
     where = f"UPPER(lotidstring)=UPPER('{lotid_norm}')"
     return _arcgis_query(url, where)
-
-# -------------------------- Per-state fetchers --------------------------
 
 def fetch_qld(lot: str, plan_type: str, plan_number: str) -> Dict:
     url = ENDPOINTS["QLD"]
@@ -333,22 +292,17 @@ def fetch_sa_by_title(volume: str, folio: str) -> Dict:
     where = f"(UPPER(volume)=UPPER('{volume}')) AND (UPPER(folio)=UPPER('{folio}'))"
     return _arcgis_query(url, where)
 
-# -------------------------- Exports --------------------------
+# --------------------- Exports ---------------------
 
 def features_to_geojson(fc: Dict) -> bytes:
     return json.dumps(fc, ensure_ascii=False).encode("utf-8")
 
 def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
-    """
-    Build KML/KMZ with ALL attributes in the description so Google Earth balloons show everything.
-    """
     if not HAVE_SIMPLEKML:
         raise RuntimeError("simplekml is not installed; cannot create KML/KMZ.")
     kml = simplekml.Kml()
     for feat in fc.get("features", []):
         props = (feat.get("properties") or {}).copy()
-
-        # Friendly name: prefer NSW/SA identifiers, else plan labels
         name = (
             props.get("lotidstring")
             or props.get("planparcel")
@@ -356,8 +310,6 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
             or props.get("PLAN") or props.get("plan")
             or "parcel"
         )
-
-        # Verbose description listing *all* attributes
         lines = []
         for k, v in sorted(props.items(), key=lambda kv: kv[0].lower()):
             if v not in (None, ""):
@@ -366,7 +318,6 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
 
         geom = feat.get("geometry", {}) or {}
         gtype = geom.get("type")
-
         if gtype == "Polygon":
             coords = []
             for ring in geom.get("coordinates", []):
@@ -388,7 +339,6 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
             lng, lat = geom.get("coordinates", [None, None])[:2]
             if lng is not None and lat is not None:
                 pt.coords = [(lng, lat)]
-
     if as_kmz:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -397,7 +347,7 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
     else:
         return ("application/vnd.google-earth.kml+xml", kml.kml().encode("utf-8"))
 
-# -------------------------- UI --------------------------
+# --------------------- UI ---------------------
 
 st.title("MappingKML — Parcel Finder")
 
@@ -407,20 +357,19 @@ with st.sidebar:
     sel_nsw = st.checkbox("New South Wales (NSW)", value=True)
     sel_sa  = st.checkbox("South Australia (SA)", value=True)
 
-    st.markdown("**Supported input formats:**")
+    st.markdown("**Input formats:**")
     st.markdown(
-        "- **NSW (lotidstring only):** `13//DP1246224`  \n"
+        "- **NSW (lotidstring only):** `13//DP1246224`  (also accepts `13/DP1246224`)  \n"
         "- **QLD:** `13/DP1242624`, `77//DP753955`, `3SP181800`, `Lot 3 on Survey Plan 181800`  \n"
-        "- **SA:** `D10001AL12` (planparcel)  •  `FOLIO/VOLUME` or `VOLUME/FOLIO` (e.g., `1234/5678`)"
+        "- **SA:** `D10001AL12`  •  `FOLIO/VOLUME` or `VOLUME/FOLIO` (e.g., `1234/5678`)"
     )
 
-MAX_LINES = 200
 examples = (
-    "13//DP1246224  # NSW lotidstring (required)\n"
+    "13//DP1246224  # NSW lotidstring\n"
     "13/DP1242624   # QLD\n"
     "3SP181800      # QLD\n"
     "D10001AL12     # SA planparcel\n"
-    "1234/5678      # SA title (folio/volume in any order)\n"
+    "1234/5678      # SA title\n"
 )
 queries_text = st.text_area("Enter one query per line", height=170, placeholder=examples)
 
@@ -434,10 +383,6 @@ if clear_btn:
     st.experimental_rerun()
 
 parsed = parse_queries(queries_text)
-if len(parsed) > MAX_LINES:
-    st.error(f"Too many lines ({len(parsed)}). Please keep it under {MAX_LINES}.")
-    st.stop()
-
 unparsed = [p["raw"] for p in parsed if p.get("unparsed")]
 if unparsed:
     st.info("Could not parse these lines (ignored):\n- " + "\n- ".join(unparsed))
@@ -453,32 +398,29 @@ def _add_features(fc):
     for f in (fc or {}).get("features", []):
         accum_features.append(f)
 
-def _warn_wrong_state(pt: str, state: str) -> Optional[str]:
-    if state == "NSW" and pt and pt not in NSW_PLAN_TYPES:
-        return f"Input has plan type '{pt}', which is unusual for NSW. Double-check."
-    if state == "QLD" and pt and pt not in QLD_PLAN_TYPES:
-        return f"Input has plan type '{pt}', which is unusual for QLD. Double-check."
-    return None
+# --------------------- Run ---------------------
 
 if run_btn and (sel_qld or sel_nsw or sel_sa):
     with st.spinner("Querying selected states..."):
-        # NSW (lotidstring direct on layer 9) — ONLY lotidstring, no fallbacks
+        # NSW — lotidstring ONLY
         if sel_nsw:
             for p in parsed:
-                if p.get("unparsed"):
+                if p.get("unparsed"): 
                     continue
-                try:
-                    if "nsw_lotid" in p:
-                        lotid = _nsw_normalize_lotid(p["nsw_lotid"])
+                if "nsw_lotid" in p:
+                    lotid = _nsw_normalize_lotid(p["nsw_lotid"])
+                    # Show what we send (helps diagnose)
+                    st.caption(f"NSW where: UPPER(lotidstring)=UPPER('{lotid}')")
+                    try:
                         fc = fetch_nsw_by_lotid(lotid)
-                        c = len(fc.get("features", []))
-                        state_counts["NSW"] += c
-                        if c == 0:
-                            state_warnings.append(f"NSW: No parcels for lotidstring '{lotid}'.")
-                        _add_features(fc)
-                        continue
-                except Exception as e:
-                    state_warnings.append(f"NSW error for {p.get('raw')}: {e}")
+                    except requests.exceptions.Timeout:
+                        state_warnings.append("NSW request timed out (12s). Try again.")
+                        fc = {"type": "FeatureCollection", "features": []}
+                    c = len(fc.get("features", []))
+                    state_counts["NSW"] += c
+                    if c == 0:
+                        state_warnings.append(f"NSW: No parcels for lotidstring '{lotid}'.")
+                    _add_features(fc)
 
         # QLD
         if sel_qld:
@@ -486,8 +428,6 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 if p.get("unparsed") or "nsw_lotid" in p or p.get("sa_planparcel") or p.get("sa_titlepair"):
                     continue
                 pt = (p.get("plan_type") or "").upper()
-                warn = _warn_wrong_state(pt, "QLD")
-                if warn: state_warnings.append("QLD: " + warn)
                 if pt:
                     try:
                         fc = fetch_qld(
@@ -495,13 +435,14 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                             plan_type=pt,
                             plan_number=p.get("plan_number")
                         )
-                        c = len(fc.get("features", []))
-                        state_counts["QLD"] += c
-                        if c == 0:
-                            state_warnings.append(f"QLD: No parcels for lot '{p.get('lot')}', plan '{pt}{p.get('plan_number')}'.")
-                        _add_features(fc)
-                    except Exception as e:
-                        state_warnings.append(f"QLD error for {p.get('raw')}: {e}")
+                    except requests.exceptions.Timeout:
+                        state_warnings.append("QLD request timed out (12s).")
+                        fc = {"type": "FeatureCollection", "features": []}
+                    c = len(fc.get("features", []))
+                    state_counts["QLD"] += c
+                    if c == 0:
+                        state_warnings.append(f"QLD: No parcels for lot '{p.get('lot')}', plan '{pt}{p.get('plan_number')}'.")
+                    _add_features(fc)
 
         # SA
         if sel_sa:
@@ -509,7 +450,6 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 if p.get("unparsed"):
                     continue
                 try:
-                    # Planparcel search
                     if "sa_planparcel" in p:
                         fc = fetch_sa_by_planparcel(p["sa_planparcel"])
                         c = len(fc.get("features", []))
@@ -518,46 +458,38 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                             state_warnings.append(f"SA: No parcels for planparcel '{p['sa_planparcel']}'.")
                         _add_features(fc)
                         continue
-
-                    # Title search (folio/volume OR volume/folio) — try both orders, union results.
                     if "sa_titlepair" in p:
                         a, b = p["sa_titlepair"]
-                        fc1 = fetch_sa_by_title(volume=a, folio=b)  # a=volume, b=folio
-                        fc2 = fetch_sa_by_title(volume=b, folio=a)  # b=volume, a=folio
-                        # Merge (avoid duplicates)
-                        seen = set()
-                        merged = {"type": "FeatureCollection", "features": []}
+                        fc1 = fetch_sa_by_title(volume=a, folio=b)
+                        fc2 = fetch_sa_by_title(volume=b, folio=a)
+                        seen = set(); merged = {"type":"FeatureCollection","features":[]}
                         for fc_try in (fc1, fc2):
                             for feat in fc_try.get("features", []):
                                 pid = (feat.get("properties") or {}).get("parcel_id") or json.dumps(
                                     feat.get("geometry", {}), sort_keys=True
                                 )
-                                if pid in seen:
+                                if pid in seen: 
                                     continue
                                 seen.add(pid)
                                 merged["features"].append(feat)
-                        c = len(merged["features"])
-                        state_counts["SA"] += c
+                        c = len(merged["features"]); state_counts["SA"] += c
                         if c == 0:
                             state_warnings.append(f"SA: No parcels for title inputs '{a}/{b}'. (Tried both volume/folio and folio/volume.)")
                         _add_features(merged)
-                        continue
-                except Exception as e:
-                    state_warnings.append(f"SA error for {p.get('raw')}: {e}")
+                except requests.exceptions.Timeout:
+                    state_warnings.append("SA request timed out (12s).")
 
-# Build a FeatureCollection for the map
+# --------------------- Map ---------------------
+
 fc_all = {"type": "FeatureCollection", "features": accum_features}
 
-# Warnings + summary
 if state_warnings:
     for w in state_warnings:
         st.warning(w, icon="⚠️")
 
 if run_btn and (sel_qld or sel_nsw or sel_sa):
-    summary = f"Found — NSW: {state_counts['NSW']}  |  QLD: {state_counts['QLD']}  |  SA: {state_counts['SA']}"
-    st.success(summary)
+    st.success(f"Found — NSW: {state_counts['NSW']}  |  QLD: {state_counts['QLD']}  |  SA: {state_counts['SA']}")
 
-# Map
 layers = []
 if accum_features:
     layers.append(
@@ -572,7 +504,6 @@ if accum_features:
         )
     )
 
-# Tooltip: NSW uses lowercase keys (lotidstring, planlabel, lotnumber, sectionnumber)
 tooltip_html = """
 <div style="font-family:Arial,sans-serif;">
   <b>{planlabel}</b><br/>
@@ -583,36 +514,32 @@ tooltip_html = """
 """
 
 view_state = _fit_view(fc_all if accum_features else None)
-deck = pdk.Deck(
-    layers=layers,
-    initial_view_state=view_state,
-    map_style=None,
-    tooltip={"html": tooltip_html}
-)
+deck = pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip={"html": tooltip_html})
 st.pydeck_chart(deck, use_container_width=True)
 
-# Downloads
-st.subheader("Downloads")
-col1, col2, col3 = st.columns(3)
+# --------------------- Downloads ---------------------
 
-with col1:
+st.subheader("Downloads")
+c1, c2, c3 = st.columns(3)
+
+with c1:
     if accum_features:
         st.download_button("⬇️ GeoJSON", data=features_to_geojson(fc_all),
                            file_name="parcels.geojson", mime="application/geo+json")
     else:
         st.caption("No features yet.")
 
-with col2:
+with c2:
     if HAVE_SIMPLEKML and accum_features:
         mime, kml_data = features_to_kml_kmz(fc_all, as_kmz=False)
         st.download_button("⬇️ KML", data=kml_data,
                            file_name="parcels.kml", mime=mime)
     elif not HAVE_SIMPLEKML:
-        st.caption("Install `simplekml` for KML/KMZ:  pip install simplekml")
+        st.caption("Install `simplekml` for KML/KMZ: pip install simplekml")
     else:
         st.caption("No features yet.")
 
-with col3:
+with c3:
     if HAVE_SIMPLEKML and accum_features:
         mime, kmz_data = features_to_kml_kmz(fc_all, as_kmz=True)
         st.download_button("⬇️ KMZ", data=kmz_data,
