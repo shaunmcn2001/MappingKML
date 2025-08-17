@@ -1,9 +1,10 @@
-# app.py — MappingKML (QLD + NSW + SA, safe-parser edition)
+# app.py — MappingKML (QLD + NSW + SA, safe full version)
 # --------------------------------------------------------------------------------------
 # ✅ Tick QLD / NSW / SA (each uses its own ArcGIS endpoint)
-# ✅ NSW/QLD: lot-plan formats (13/DP1242624, 77//DP753955, 3SP181800, Lot 3 on Survey Plan 181800)
-# ✅ SA: planparcel format (e.g., D10001AL12)  +  title search (folio/volume in any order, e.g., 1234/5678)
-# ✅ Defensive parsing (fixes NameError), robust map fit (no crashes), retries, clean warnings, downloads
+# ✅ NSW/QLD: 13/DP1242624, 13/1/DP1242624, 77//DP753955, 3SP181800,
+#            "Lot 3 on Survey Plan 181800", "Lot 1 on Registered Plan 164839"
+# ✅ SA: planparcel like D10001AL12  +  title search "folio/volume" or "volume/folio" (e.g., 1234/5678)
+# ✅ Defensive parsing (no NameError), retries, safe map fit (no crashes), GeoJSON/KML/KMZ downloads
 # --------------------------------------------------------------------------------------
 
 import io
@@ -25,30 +26,30 @@ try:
 except Exception:
     HAVE_SIMPLEKML = False
 
-# --------------- App config ---------------
+# -------------------------- App config --------------------------
 
 st.set_page_config(page_title="MappingKML", layout="wide")
 
-# 🔗 ArcGIS REST endpoints (edit here if your services change)
+# ArcGIS REST endpoints
 ENDPOINTS = {
-    # QLD Cadastre (example layer)
+    # QLD Cadastre (adjust if your layer differs)
     "QLD": "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Cadastre/LandParcels/MapServer/0/query",
 
-    # NSW Cadastre (SIX Maps public service layer)
+    # NSW Cadastre (SIX Maps public layer)
     "NSW": "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/0/query",
 
     # SA Cadastre (Reference_WFL1 FeatureServer, Layer 1)
     "SA": "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
 }
 
-# 🗺️ Default east-AU view fallback
+# Default east-AU view fallback
 DEFAULT_VIEW = pdk.ViewState(latitude=-32.0, longitude=147.0, zoom=5.0, pitch=0, bearing=0)
 
 # Per-state accepted plan types (helps catch mismatches)
 NSW_PLAN_TYPES = {"DP", "SP", "SC", "CP", "DPX"}
 QLD_PLAN_TYPES = {"SP", "RP", "CP", "BUP", "GTP", "PC", "SL", "CSP"}
 
-# --------------- Geo helpers (safe) ---------------
+# -------------------------- Geo helpers --------------------------
 
 def _as_feature_collection(fc_like):
     if fc_like is None:
@@ -151,79 +152,81 @@ def _fit_view(fc_like, warn_if_empty=True):
         return DEFAULT_VIEW
     return _bbox_to_viewstate(bbox, padding_ratio=0.12)
 
-# --------------- Input parsing (SAFE) ---------------
+# -------------------------- Input parsing (SAFE) --------------------------
 
-# NSW/QLD styles
-re_lotplan_slash = re.compile(
+# NSW/QLD patterns
+RE_LOTPLAN_SLASH = re.compile(
     r"^\s*(?P<lot>\d+)\s*(?:/(?P<section>\d+))?\s*/\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$"
 )
-re_compact = re.compile(
+RE_COMPACT = re.compile(
     r"^\s*(?P<lot>\d+)\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$"
 )
-re_verbose = re.compile(
+RE_VERBOSE = re.compile(
     r"^\s*Lot\s+(?P<lot>\d+)\s+on\s+(?P<plan_label>(Registered|Survey)\s+Plan)\s+(?P<plan_number>\d+)\s*$",
     re.IGNORECASE
 )
 
-# SA styles
-# planparcel like D10001AL12  (letters+digits+letters+digits; we accept 1–2 letters in each letter group)
-re_sa_planparcel = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
-# title pair as two integers with slash, any order: folio/volume OR volume/folio
-re_sa_titlepair  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
+# SA patterns
+# planparcel like D10001AL12  (letters+digits+letters+digits; accept 1–2 letters each group)
+RE_SA_PLANPARCEL = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
+# title pair two integers with slash, any order: folio/volume OR volume/folio
+RE_SA_TITLEPAIR  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
 
 def parse_queries(multiline: str) -> List[Dict]:
-    """Return a list of parsed query dicts. Never raises NameError on partial matches."""
+    """
+    Return a list of parsed query dicts.
+    Never references undefined variables, never raises NameError on bad lines.
+    """
     items: List[Dict] = []
     lines = [x.strip() for x in (multiline or "").splitlines() if x.strip()]
+
     for raw in lines:
         # 1) NSW like 13/1/DP1242624 or 13/DP1242624
-        m = re_lotplan_slash.match(raw)
+        m = RE_LOTPLAN_SLASH.match(raw)
         if m:
-            d = m.groupdict()
+            lot       = m.group("lot")
+            section   = m.group("section")
+            plan_type = (m.group("plan_type") or "").upper()
+            plan_num  = m.group("plan_number")
             items.append({
-                "raw": raw,
-                "lot": d.get("lot"),
-                "section": d.get("section"),
-                "plan_type": (d.get("plan_type") or "").upper(),
-                "plan_number": d.get("plan_number"),
+                "raw": raw, "lot": lot, "section": section,
+                "plan_type": plan_type, "plan_number": plan_num
             })
             continue
 
         # 2) Compact like 3SP181800
-        m = re_compact.match(raw)
+        m = RE_COMPACT.match(raw)
         if m:
-            d = m.groupdict()
+            lot       = m.group("lot")
+            plan_type = (m.group("plan_type") or "").upper()
+            plan_num  = m.group("plan_number")
             items.append({
-                "raw": raw,
-                "lot": d.get("lot"),
-                "section": None,
-                "plan_type": (d.get("plan_type") or "").upper(),
-                "plan_number": d.get("plan_number"),
+                "raw": raw, "lot": lot, "section": None,
+                "plan_type": plan_type, "plan_number": plan_num
             })
             continue
 
         # 3) Verbose like "Lot 3 on Survey Plan 181800"
-        m = re_verbose.match(raw)
+        m = RE_VERBOSE.match(raw)
         if m:
-            d = m.groupdict()
-            plan_type = "SP" if "Survey" in d.get("plan_label", "") else "RP"
+            lot       = m.group("lot")
+            plan_lbl  = m.group("plan_label") or ""
+            plan_num  = m.group("plan_number")
+            plan_type = "SP" if "Survey" in plan_lbl else "RP"
             items.append({
-                "raw": raw,
-                "lot": d.get("lot"),
-                "section": None,
-                "plan_type": plan_type,
-                "plan_number": d.get("plan_number"),
+                "raw": raw, "lot": lot, "section": None,
+                "plan_type": plan_type, "plan_number": plan_num
             })
             continue
 
         # 4) SA planparcel, e.g., D10001AL12
-        m = re_sa_planparcel.match(raw)
+        m = RE_SA_PLANPARCEL.match(raw)
         if m:
             items.append({"raw": raw, "sa_planparcel": m.group("planparcel").upper()})
             continue
 
-        # 5) SA title pair (folio/volume or volume/folio), e.g., 1234/5678
-        m = re_sa_titlepair.match(raw)
+        # 5) SA title pair (folio/volume OR volume/folio), e.g., 1234/5678
+        m = RE_SA_TITLEPAIR.match(raw)
         if m:
             a, b = m.group("a"), m.group("b")
             items.append({"raw": raw, "sa_titlepair": (a, b)})
@@ -236,22 +239,22 @@ def parse_queries(multiline: str) -> List[Dict]:
                 lot = left.strip()
                 m2 = re.match(r"^([A-Za-z]{1,6})\s*(\d+)$", right.strip())
                 if lot and m2:
+                    plan_type = m2.group(1).upper()
+                    plan_num  = m2.group(2)
                     items.append({
-                        "raw": raw,
-                        "lot": lot,
-                        "section": None,
-                        "plan_type": m2.group(1).upper(),
-                        "plan_number": m2.group(2),
+                        "raw": raw, "lot": lot, "section": None,
+                        "plan_type": plan_type, "plan_number": plan_num
                     })
                     continue
             except Exception:
                 pass
 
-        # If nothing matched, record it so the UI can warn instead of crashing
+        # 7) Nothing matched
         items.append({"raw": raw, "unparsed": True})
+
     return items
 
-# --------------- HTTP (retry) ---------------
+# -------------------------- HTTP (retry) --------------------------
 
 def _http_get_json(url: str, params: Dict, retries: int = 2, timeout: int = 25) -> Dict:
     last_err = None
@@ -295,17 +298,19 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
         features.append({"type": "Feature", "geometry": geo, "properties": attrs})
     return {"type": "FeatureCollection", "features": features}
 
-# --------------- Per-state fetchers ---------------
+# -------------------------- Per-state fetchers --------------------------
 
 def fetch_qld(lot: str, plan_type: str, plan_number: str) -> Dict:
     url = ENDPOINTS["QLD"]
     plan_full = f"{plan_type}{plan_number}"
+    # Common QLD fields: LOT, PLAN (PLAN contains type, e.g., RP123456)
     where = f"(UPPER(LOT)=UPPER('{lot}')) AND (UPPER(PLAN)=UPPER('{plan_full}'))"
     return _arcgis_query(url, where)
 
 def fetch_nsw(lot: str, plan_type: str, plan_number: str, section: Optional[str] = None) -> Dict:
     url = ENDPOINTS["NSW"]
     plan_full = f"{plan_type}{plan_number}"
+    # Common NSW fields: LOT_NUMBER, SECTION_NUMBER, PLAN_LABEL
     if section:
         where = (
             f"(UPPER(LOT_NUMBER)=UPPER('{lot}')) AND (UPPER(SECTION_NUMBER)=UPPER('{section}')) "
@@ -315,7 +320,7 @@ def fetch_nsw(lot: str, plan_type: str, plan_number: str, section: Optional[str]
         where = f"(UPPER(LOT_NUMBER)=UPPER('{lot}')) AND (UPPER(PLAN_LABEL)=UPPER('{plan_full}'))"
     return _arcgis_query(url, where)
 
-# --- SA fetchers ---
+# ----- SA fetchers -----
 
 def fetch_sa_by_planparcel(planparcel_str: str) -> Dict:
     """
@@ -335,7 +340,7 @@ def fetch_sa_by_title(volume: str, folio: str) -> Dict:
     where = f"(UPPER(volume)=UPPER('{volume}')) AND (UPPER(folio)=UPPER('{folio}'))"
     return _arcgis_query(url, where)
 
-# --------------- Exports ---------------
+# -------------------------- Exports --------------------------
 
 def features_to_geojson(fc: Dict) -> bytes:
     return json.dumps(fc, ensure_ascii=False).encode("utf-8")
@@ -384,7 +389,7 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
     else:
         return ("application/vnd.google-earth.kml+xml", kml.kml().encode("utf-8"))
 
-# --------------- UI ---------------
+# -------------------------- UI --------------------------
 
 st.title("MappingKML — Parcel Finder")
 
@@ -396,17 +401,16 @@ with st.sidebar:
 
     st.markdown("**Supported input formats:**")
     st.markdown(
-        "- **NSW/QLD:** `13/DP1242624`, `77//DP753955` (no section), `3SP181800`, `Lot 3 on Survey Plan 181800`  \n"
+        "- **NSW/QLD:** `13/DP1242624`, `13/1/DP1242624`, `77//DP753955`, `3SP181800`, "
+        "`Lot 3 on Survey Plan 181800`, `Lot 1 on Registered Plan 164839`  \n"
         "- **SA planparcel:** `D10001AL12`  \n"
-        "- **SA title:** `FOLIO/VOLUME` or `VOLUME/FOLIO` (e.g., `1234/5678` or `5678/1234`)"
+        "- **SA title:** `FOLIO/VOLUME` or `VOLUME/FOLIO` (e.g., `1234/5678`)"
     )
 
-# Guardrails
 MAX_LINES = 200
 examples = (
-    "13/DP1242624\n77//DP753955\n3SP181800\n"
-    "Lot 3 on Survey Plan 181800\n"
-    "D10001AL12\n1234/5678"
+    "13/DP1242624\n13/1/DP1242624\n77//DP753955\n3SP181800\n"
+    "Lot 3 on Survey Plan 181800\nD10001AL12\n1234/5678"
 )
 queries_text = st.text_area("Enter one query per line", height=170, placeholder=examples)
 
@@ -459,21 +463,21 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 if pt:
                     try:
                         fc = fetch_nsw(
-                            lot=p["lot"],
+                            lot=p.get("lot"),
                             plan_type=pt,
-                            plan_number=p["plan_number"],
+                            plan_number=p.get("plan_number"),
                             section=p.get("section")
                         )
                         c = len(fc.get("features", []))
                         state_counts["NSW"] += c
                         if c == 0:
-                            msg = f"NSW: No parcels for lot '{p['lot']}'"
-                            if p.get("section"): msg += f", section '{p['section']}'"
-                            msg += f", plan '{pt}{p['plan_number']}'."
+                            msg = f"NSW: No parcels for lot '{p.get('lot')}'"
+                            if p.get("section"): msg += f", section '{p.get('section')}'"
+                            msg += f", plan '{pt}{p.get('plan_number')}'."
                             state_warnings.append(msg)
                         _add_features(fc)
                     except Exception as e:
-                        state_warnings.append(f"NSW error for {p['raw']}: {e}")
+                        state_warnings.append(f"NSW error for {p.get('raw')}: {e}")
 
         # QLD
         if sel_qld:
@@ -485,14 +489,18 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 if warn: state_warnings.append("QLD: " + warn)
                 if pt:
                     try:
-                        fc = fetch_qld(lot=p["lot"], plan_type=pt, plan_number=p["plan_number"])
+                        fc = fetch_qld(
+                            lot=p.get("lot"),
+                            plan_type=pt,
+                            plan_number=p.get("plan_number")
+                        )
                         c = len(fc.get("features", []))
                         state_counts["QLD"] += c
                         if c == 0:
-                            state_warnings.append(f"QLD: No parcels for lot '{p['lot']}', plan '{pt}{p['plan_number']}'.")
+                            state_warnings.append(f"QLD: No parcels for lot '{p.get('lot')}', plan '{pt}{p.get('plan_number')}'.")
                         _add_features(fc)
                     except Exception as e:
-                        state_warnings.append(f"QLD error for {p['raw']}: {e}")
+                        state_warnings.append(f"QLD error for {p.get('raw')}: {e}")
 
         # SA
         if sel_sa:
@@ -515,7 +523,6 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                         a, b = p["sa_titlepair"]
                         fc1 = fetch_sa_by_title(volume=a, folio=b)  # assume a=volume, b=folio
                         fc2 = fetch_sa_by_title(volume=b, folio=a)  # assume b=volume, a=folio
-                        # merge features (avoid dupes by parcel_id if present)
                         seen = set()
                         merged = {"type": "FeatureCollection", "features": []}
                         for fc_try in (fc1, fc2):
@@ -532,9 +539,9 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                         _add_features(merged)
                         continue
 
-                    # If line was a NSW/QLD style (lot/plan), ignore for SA
+                    # Ignore NSW/QLD style lines for SA
                 except Exception as e:
-                    state_warnings.append(f"SA error for {p['raw']}: {e}")
+                    state_warnings.append(f"SA error for {p.get('raw')}: {e}")
 
 # Build a FeatureCollection for the map
 fc_all = {"type": "FeatureCollection", "features": accum_features}
@@ -562,12 +569,23 @@ if accum_features:
             get_line_width=2,
         )
     )
+
+# Keep tooltip robust (keys may not exist on every state)
+tooltip_html = """
+<div style="font-family:Arial,sans-serif;">
+  <b>{PLAN_LABEL}</b><br/>
+  Lot {LOT_NUMBER} | Plan {PLAN}<br/>
+  <i>{planparcel}</i><br/>
+  SA Title: Vol {volume} / Fol {folio}
+</div>
+"""
+
 view_state = _fit_view(fc_all if accum_features else None)
 deck = pdk.Deck(
     layers=layers,
     initial_view_state=view_state,
     map_style=None,
-    tooltip={"html": "<b>{planparcel}</b><br/>Lot {LOT_NUMBER} | Plan {PLAN_LABEL}"}
+    tooltip={"html": tooltip_html}
 )
 st.pydeck_chart(deck, use_container_width=True)
 
