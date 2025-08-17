@@ -3,6 +3,7 @@
 # QLD: lot + plan
 # SA : planparcel or title (volume/folio in any order)
 # Exports: GeoJSON, KML, KMZ (Google Earth balloons show ALL attributes)
+# All requests: 12s timeout, no retries (keep UI responsive)
 
 import io
 import json
@@ -166,6 +167,10 @@ def _nsw_normalize_lotid(raw: str) -> str:
     m = RE_NSW_ONE_SLASH.match(s)
     return f"{m.group('lot')}//{m.group('plan')}" if m else s
 
+def _nsw_where_clause(lotid_norm: str) -> str:
+    """Return the case-insensitive where clause for a normalised NSW lotidstring."""
+    return f"UPPER(lotidstring)=UPPER('{lotid_norm}')"
+
 def parse_queries(multiline: str) -> List[Dict]:
     items: List[Dict] = []
     lines = [x.strip() for x in (multiline or "").splitlines() if x.strip()]
@@ -270,10 +275,9 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
 
 # --------------------- Fetchers ---------------------
 
-def fetch_nsw_by_lotid(lotid: str) -> Dict:
+def fetch_nsw_by_lotid(lotid_norm: str) -> Dict:
     url = ENDPOINTS["NSW"]
-    lotid_norm = _nsw_normalize_lotid(lotid)
-    where = f"UPPER(lotidstring)=UPPER('{lotid_norm}')"
+    where = _nsw_where_clause(lotid_norm)
     return _arcgis_query(url, where)
 
 def fetch_qld(lot: str, plan_type: str, plan_number: str) -> Dict:
@@ -405,12 +409,12 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
         # NSW — lotidstring ONLY
         if sel_nsw:
             for p in parsed:
-                if p.get("unparsed"): 
+                if p.get("unparsed"):
                     continue
                 if "nsw_lotid" in p:
-                    lotid = _nsw_normalize_lotid(p["nsw_lotid"])
-                    # Show what we send (helps diagnose)
-                    st.caption(f"NSW where: UPPER(lotidstring)=UPPER('{lotid}')")
+                    lotid = p["nsw_lotid"]
+                    where = _nsw_where_clause(lotid)
+                    st.caption(f"NSW where: {where}")
                     try:
                         fc = fetch_nsw_by_lotid(lotid)
                     except requests.exceptions.Timeout:
