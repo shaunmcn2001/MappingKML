@@ -1,170 +1,228 @@
-# nsw_query.py
-import re
-import requests
-from typing import Optional, Tuple, Dict, Any, List
+# nsw_cadastre.py
+"""
+Lightweight NSW Cadastre (layer 9) client — query by lotidstring only.
 
-NSW_FEATURESERVER_8 = (
-    "https://portal.spatial.nsw.gov.au/server/rest/services/"
-    "NSW_Land_Parcel_Property_Theme/FeatureServer/8/query"
+- Endpoint: https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query
+- WHERE supports simple equality only (no SQL functions).
+- Use exact: where=lotidstring='<UPPER VALUE WITH //>'
+
+Public API:
+    - normalize_lotid(raw: str) -> str
+    - fetch_one(lotid: str, *, timeout=12) -> dict[FeatureCollection]
+    - fetch_bulk(lotids: list[str], *, max_workers=6, timeout=12) -> dict[FeatureCollection]
+    - count(lotid: str, *, timeout=8) -> int
+    - ids_only(lotid: str, *, timeout=8) -> list[int]
+
+All functions return GeoJSON FeatureCollection (or simple types where noted).
+No external deps beyond 'requests' (install via pip if needed).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Dict, List, Tuple
+import concurrent.futures
+import requests
+
+# ---- Constants ----
+
+NSW_LAYER9_QUERY = (
+    "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query"
 )
 
-# Common attribute keys that may hold "section"
-SECTION_KEYS = ["section", "sectionnumber", "sec", "section_no", "sect_no", "section_num"]
+DEFAULT_TIMEOUT = 12
+DEFAULT_MAX_WORKERS = 6
 
-class NSWQueryError(Exception):
-    pass
+# Shared HTTP session for connection reuse
+_SESSION = requests.Session()
 
-def _clean_token(s: str) -> str:
-    return re.sub(r"\s+", "", s.strip())
+# ---- Utilities ----
 
-def _normalise_plan(plan: str) -> str:
-    p = _clean_token(plan).upper()
-    # digits only -> assume DP (NSW default)
-    if re.fullmatch(r"\d{1,7}", p):
-        return f"DP{p}"
-    # e.g. DP753311 / SP181800
-    if re.fullmatch(r"[A-Z]{1,3}\d{1,7}", p):
-        return p
-    p2 = re.sub(r"\s+", "", p)
-    if re.fullmatch(r"[A-Z]{1,3}\d{1,7}", p2):
-        return p2
-    raise NSWQueryError(f"Could not parse plan label from '{plan}'. Use e.g. 'DP753311'.")
+_RE_NSW_LOTID_DOUBLE = re.compile(r"^\s*(?P<lot>\d+)\s*//\s*(?P<plan>[A-Za-z]{1,6}\d+)\s*$")
+_RE_NSW_LOTID_ONE    = re.compile(r"^\s*(?P<lot>\d+)\s*/\s*(?P<plan>[A-Za-z]{1,6}\d+)\s*$")
 
-def _validate_lot_plan(lot: str, planlabel: str) -> None:
-    if not re.fullmatch(r"\d+", lot):
-        raise NSWQueryError(f"Invalid lot '{lot}'. Lot must be an integer.")
-    if not re.fullmatch(r"[A-Z]{1,3}\d{1,7}", planlabel):
-        raise NSWQueryError(f"Invalid plan '{planlabel}'. Expected like 'DP753311'.")
 
-def parse_lot_section_plan(raw: str) -> Tuple[str, Optional[str], str]:
+def normalize_lotid(raw: str) -> str:
     """
+    Normalize user input to NSW 'LOT//PLAN' uppercase form.
+
     Accepts:
-      - 'lot/section/plan'   e.g. '3/2/DP753311'
-      - 'lot//plan'          e.g. '3//DP753311' (no section)
-      - 'lot/plan'           e.g. '3/DP753311'  (treated as lot//plan)
-      - 'Lot 3 Sec 2 DP753311' or 'Lot 3 DP753311'
-    Returns: (lot, section_or_None, planlabel)
-    """
-    s = raw.strip()
+        - "13//DP1246224"
+        - "13/DP1246224"
+        - with arbitrary spacing and casing
 
-    # Verbose formats (Lot/Sec/Plan in any spacing)
-    m = re.search(
-        r"(?i)lot\s*(\d+)\s*(?:sec(?:tion)?\s*(\w+))?\s*(?:dp|sp|cp|pp|mp)?\s*([a-zA-Z]{1,3})?\s*(\d{1,7})",
-        s,
-    )
+    Returns:
+        "13//DP1246224" (uppercased, double slash), or original trimmed UPPER if no match.
+    """
+    s = (raw or "").strip().upper().replace(" ", "")
+    m = _RE_NSW_LOTID_DOUBLE.match(s)
     if m:
-        lot = m.group(1)
-        sec = m.group(2)
-        pref = (m.group(3) or "").upper()
-        num = m.group(4)
-        planlabel = f"{pref}{num}" if pref else f"DP{num}"
-        section = _clean_token(sec) if sec else None
-        _validate_lot_plan(lot, planlabel)
-        return lot, section, planlabel
+        return f"{m.group('lot')}//{m.group('plan')}"
+    m = _RE_NSW_LOTID_ONE.match(s)
+    if m:
+        return f"{m.group('lot')}//{m.group('plan')}"
+    return s
 
-    # Slash formats
-    parts = [p.strip() for p in s.split("/") if p is not None]
 
-    if len(parts) == 3:
-        lot, section, plan = parts[0], parts[1], parts[2]
-        lot = _clean_token(lot)
-        section = _clean_token(section) or None
-        planlabel = _normalise_plan(plan)
-        _validate_lot_plan(lot, planlabel)
-        return lot, section, planlabel
-
-    if len(parts) == 2:
-        # treat 'lot/plan' as 'lot//plan'
-        lot, plan = parts[0], parts[1]
-        lot = _clean_token(lot)
-        planlabel = _normalise_plan(plan)
-        _validate_lot_plan(lot, planlabel)
-        return lot, None, planlabel
-
-    # Space separated: "3 DP753311"
-    m2 = re.match(r"^\s*(\d+)\s*([A-Za-z]{1,3})\s*(\d{1,7})\s*$", s)
-    if m2:
-        lot = _clean_token(m2.group(1))
-        planlabel = f"{m2.group(2).upper()}{m2.group(3)}"
-        _validate_lot_plan(lot, planlabel)
-        return lot, None, planlabel
-
-    raise NSWQueryError(
-        "NSW expects 'lot/section/plan'. If there is no section, use 'lot//plan' (e.g., 3//DP753311)."
-    )
-
-def query_nsw_lsp(user_input: str, timeout: int = 30) -> Dict[str, Any]:
+def _http_get_json(params: Dict, *, timeout: int) -> Dict:
     """
-    Robust NSW query:
-      1) Parse lot/section/plan from user input
-      2) Query ALL parcels for the plan (planlabel) once
-      3) Filter locally by lotnumber (and sectionnumber if provided)
-    Returns GeoJSON FeatureCollection in EPSG:4326.
+    Issue a GET to the NSW layer with safe defaults; caller passes specific params.
     """
-    lot, section, planlabel = parse_lot_section_plan(user_input)
-
-    # --- Step 1: fetch all features on the plan (server-side WHERE is simple & reliable)
-    base_params = {
-        "where": f"UPPER(planlabel)=UPPER('{planlabel}')",
-        "outFields": "*",
+    base = {
+        "f": "json",
         "outSR": 4326,
         "returnGeometry": "true",
-        "f": "geojson",
+        "geometryPrecision": 6,
+        "returnExceededLimitFeatures": "false",
     }
-    r = requests.get(NSW_FEATURESERVER_8, params=base_params, timeout=timeout)
+    resp = _SESSION.get(NSW_LAYER9_QUERY, params={**base, **params}, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _arcgis_to_featurecollection(data: Dict) -> Dict:
+    """
+    Convert ArcGIS service 'features' into GeoJSON FeatureCollection.
+    """
+    feats = []
+    for g in data.get("features", []):
+        geom = g.get("geometry")
+        attrs = g.get("attributes", {}) or {}
+
+        if not geom:  # skip if no geometry
+            continue
+
+        if "rings" in geom:  # polygon
+            geo = {"type": "Polygon", "coordinates": geom["rings"]}
+        elif "paths" in geom:  # multiline
+            geo = {"type": "MultiLineString", "coordinates": geom["paths"]}
+        elif "x" in geom and "y" in geom:  # point
+            geo = {"type": "Point", "coordinates": [geom["x"], geom["y"]]}
+        else:
+            continue
+
+        feats.append({"type": "Feature", "geometry": geo, "properties": attrs})
+
+    return {"type": "FeatureCollection", "features": feats}
+
+
+# ---- Public: one-shot feature fetch ----
+
+def fetch_one(lotid: str, *, timeout: int = DEFAULT_TIMEOUT) -> Dict:
+    """
+    One-shot query: attributes + geometry by exact lotidstring.
+
+    Returns:
+        GeoJSON FeatureCollection (may have 0, 1, or many features).
+    """
+    lotid_norm = normalize_lotid(lotid)
+    params = {
+        "where": f"lotidstring='{lotid_norm}'",  # NOTE: simple equality only
+        "outFields": "*",
+    }
+    data = _http_get_json(params, timeout=timeout)
+    return _arcgis_to_featurecollection(data)
+
+
+# ---- Public: bulk feature fetch (parallel) ----
+
+def fetch_bulk(lotids: List[str], *, max_workers: int = DEFAULT_MAX_WORKERS, timeout: int = DEFAULT_TIMEOUT) -> Dict:
+    """
+    Fetch many lotidstrings in parallel and merge into one FeatureCollection.
+
+    - Each lot is fetched with a one-shot query (attributes + geometry).
+    - Results are de-duplicated by (objectid, lotidstring).
+
+    Args:
+        lotids: list of lotidstring-like inputs (any casing; '/' or '//' accepted)
+        max_workers: small thread pool size (default 6)
+        timeout: per-request timeout in seconds (default 12)
+
+    Returns:
+        GeoJSON FeatureCollection.
+    """
+    lotids_norm = [normalize_lotid(x) for x in lotids if x and str(x).strip()]
+    if not lotids_norm:
+        return {"type": "FeatureCollection", "features": []}
+
+    def _task(lid: str) -> Tuple[str, Dict]:
+        try:
+            return lid, fetch_one(lid, timeout=timeout)
+        except Exception as e:
+            return lid, {"_error": str(e)}
+
+    features: List[Dict] = []
+    errors: List[str] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for lid, res in ex.map(_task, lotids_norm):
+            if "_error" in res:
+                errors.append(f"{lid}: {res['_error']}")
+                continue
+            features.extend(res.get("features", []))
+
+    # De-dup by (objectid, lotidstring)
+    seen = set()
+    uniq = []
+    for f in features:
+        props = f.get("properties") or {}
+        sig = (props.get("objectid"), props.get("lotidstring"))
+        if sig not in seen:
+            seen.add(sig)
+            uniq.append(f)
+
+    fc = {"type": "FeatureCollection", "features": uniq}
+    if errors:
+        # Non-fatal; if you want to inspect:
+        fc["_errors"] = errors
+    return fc
+
+
+# ---- Optional helpers: count & ids-only (you can ignore if not needed) ----
+
+def count(lotid: str, *, timeout: int = 8) -> int:
+    """
+    Fast existence check; returns integer count.
+    """
+    lotid_norm = normalize_lotid(lotid)
+    data = _http_get_json(
+        {"where": f"lotidstring='{lotid_norm}'", "returnCountOnly": "true"},
+        timeout=timeout,
+    )
+    return int(data.get("count", 0) or 0)
+
+
+def ids_only(lotid: str, *, timeout: int = 8) -> List[int]:
+    """
+    Fetch only object IDs for a lotidstring (tiny response).
+    Useful if you want to fetch geometry later via objectIds=...
+    """
+    lotid_norm = normalize_lotid(lotid)
+    data = _http_get_json(
+        {"where": f"lotidstring='{lotid_norm}'", "returnIdsOnly": "true"},
+        timeout=timeout,
+    )
+    return list(data.get("objectIds", []) or [])
+
+
+# ---- Tiny CLI for ad-hoc testing ----
+
+if __name__ == "__main__":
+    import argparse, sys
+
+    ap = argparse.ArgumentParser(description="NSW layer 9 client (lotidstring only)")
+    ap.add_argument("lotids", nargs="+", help="lotidstrings like 13//DP1246224 or 13/DP1246224")
+    ap.add_argument("--bulk", action="store_true", help="fetch all lotids in parallel")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    args = ap.parse_args()
+
     try:
-        r.raise_for_status()
+        if args.bulk and len(args.lotids) > 1:
+            fc = fetch_bulk(args.lotids, timeout=args.timeout)
+        else:
+            fc = fetch_one(args.lotids[0], timeout=args.timeout)
+        sys.stdout.write(json.dumps(fc, ensure_ascii=False, indent=2))
     except Exception as e:
-        raise NSWQueryError(f"NSW request failed: {e}")
-
-    data = r.json()
-    feats = data.get("features", [])
-
-    if not feats:
-        # Extra helpful context for your UI
-        raise NSWQueryError(
-            f"No NSW parcels for plan '{planlabel}'. "
-            f"Confirm the plan exists and is a NSW DP/SP/CP."
-        )
-
-    # --- Step 2: filter by lot (and optional section) client-side
-    def _props(feat):
-        return feat.get("properties") or feat.get("attributes") or {}
-
-    lot_filtered = [f for f in feats if str(_props(f).get("lotnumber", "")).strip().upper() == str(lot).strip().upper()]
-
-    if not lot_filtered:
-        # Show available lots on this plan to guide the user
-        lots_available = sorted({str(_props(f).get("lotnumber", "")).strip() for f in feats if _props(f).get("lotnumber") is not None})
-        raise NSWQueryError(
-            f"No lot '{lot}' found on plan '{planlabel}'. "
-            f"Lots on this plan include: {', '.join(lots_available) if lots_available else 'n/a'}."
-        )
-
-    if section is None:
-        return {"type": "FeatureCollection", "features": lot_filtered}
-
-    # Filter by section across common keys; NSW generally uses 'sectionnumber'
-    SECTION_KEYS = ["sectionnumber", "section", "sec", "section_no", "sect_no", "section_num"]
-    def _section_match(props):
-        target = str(section).strip().upper()
-        for k in SECTION_KEYS:
-            if k in props and props[k] is not None:
-                if str(props[k]).strip().upper() == target:
-                    return True
-        return False
-
-    final = [f for f in lot_filtered if _section_match(_props(f))]
-
-    if not final:
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "note": (
-                f"Found {len(lot_filtered)} feature(s) for Lot {lot} on {planlabel}, "
-                f"but none matched section '{section}'. If there is no section, use 'lot//plan'."
-            ),
-        }
-
-    return {"type": "FeatureCollection", "features": final}
-
+        sys.stderr.write(f"ERROR: {e}\n")
+        sys.exit(1)
