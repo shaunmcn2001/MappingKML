@@ -1,9 +1,9 @@
-# app.py — MappingKML (QLD + NSW + SA wired)
+# app.py — MappingKML (QLD + NSW + SA, safe-parser edition)
 # --------------------------------------------------------------------------------------
-# ✅ Tick QLD / NSW / SA (each has its own REST endpoint)
+# ✅ Tick QLD / NSW / SA (each uses its own ArcGIS endpoint)
 # ✅ NSW/QLD: lot-plan formats (13/DP1242624, 77//DP753955, 3SP181800, Lot 3 on Survey Plan 181800)
 # ✅ SA: planparcel format (e.g., D10001AL12)  +  title search (folio/volume in any order, e.g., 1234/5678)
-# ✅ Robust map fit (no crashes), retries, clean warnings, downloads (GeoJSON / KML / KMZ)
+# ✅ Defensive parsing (fixes NameError), robust map fit (no crashes), retries, clean warnings, downloads
 # --------------------------------------------------------------------------------------
 
 import io
@@ -37,7 +37,7 @@ ENDPOINTS = {
     # NSW Cadastre (SIX Maps public service layer)
     "NSW": "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/0/query",
 
-    # SA Cadastre (Parcel Cadastre, Layer ID: 1)
+    # SA Cadastre (Reference_WFL1 FeatureServer, Layer 1)
     "SA": "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
 }
 
@@ -151,7 +151,7 @@ def _fit_view(fc_like, warn_if_empty=True):
         return DEFAULT_VIEW
     return _bbox_to_viewstate(bbox, padding_ratio=0.12)
 
-# --------------- Input parsing ---------------
+# --------------- Input parsing (SAFE) ---------------
 
 # NSW/QLD styles
 re_lotplan_slash = re.compile(
@@ -169,63 +169,67 @@ re_verbose = re.compile(
 # planparcel like D10001AL12  (letters+digits+letters+digits; we accept 1–2 letters in each letter group)
 re_sa_planparcel = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
 # title pair as two integers with slash, any order: folio/volume OR volume/folio
-re_sa_titlepair = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
+re_sa_titlepair  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
 
 def parse_queries(multiline: str) -> List[Dict]:
+    """Return a list of parsed query dicts. Never raises NameError on partial matches."""
     items: List[Dict] = []
-    for raw in [x.strip() for x in (multiline or "").splitlines() if x.strip()]:
-        # NSW like 13/1/DP1242624 or 13/DP1242624
+    lines = [x.strip() for x in (multiline or "").splitlines() if x.strip()]
+    for raw in lines:
+        # 1) NSW like 13/1/DP1242624 or 13/DP1242624
         m = re_lotplan_slash.match(raw)
         if m:
             d = m.groupdict()
             items.append({
                 "raw": raw,
-                "lot": d["lot"],
+                "lot": d.get("lot"),
                 "section": d.get("section"),
-                "plan_type": (d["plan_type"] or "").upper(),
-                "plan_number": d["plan_number"]
+                "plan_type": (d.get("plan_type") or "").upper(),
+                "plan_number": d.get("plan_number"),
             })
             continue
-        # Compact like 3SP181800
+
+        # 2) Compact like 3SP181800
         m = re_compact.match(raw)
         if m:
             d = m.groupdict()
             items.append({
                 "raw": raw,
-                "lot": d["lot"],
+                "lot": d.get("lot"),
                 "section": None,
-                "plan_type": (d["plan_type"] or "").upper(),
-                "plan_number": d["plan_number"]
-            })
-            continue
-        # Verbose like Lot 3 on Survey Plan 181800
-        m = re_verbose.match(raw)
-        if m:
-            d = m.groupdict()
-            plan_type = "SP" if "Survey" in d["plan_label"] else "RP"
-            items.append({
-                "raw": raw,
-                "lot": d["lot"],
-                "section": None,
-                "plan_type": plan_type,
-                "plan_number": d["plan_number"]
+                "plan_type": (d.get("plan_type") or "").upper(),
+                "plan_number": d.get("plan_number"),
             })
             continue
 
-        # SA planparcel, e.g., D10001AL12
+        # 3) Verbose like "Lot 3 on Survey Plan 181800"
+        m = re_verbose.match(raw)
+        if m:
+            d = m.groupdict()
+            plan_type = "SP" if "Survey" in d.get("plan_label", "") else "RP"
+            items.append({
+                "raw": raw,
+                "lot": d.get("lot"),
+                "section": None,
+                "plan_type": plan_type,
+                "plan_number": d.get("plan_number"),
+            })
+            continue
+
+        # 4) SA planparcel, e.g., D10001AL12
         m = re_sa_planparcel.match(raw)
         if m:
             items.append({"raw": raw, "sa_planparcel": m.group("planparcel").upper()})
             continue
 
-        # SA title pair, e.g., 1234/5678 (folio/volume OR volume/folio)
+        # 5) SA title pair (folio/volume or volume/folio), e.g., 1234/5678
         m = re_sa_titlepair.match(raw)
         if m:
             a, b = m.group("a"), m.group("b")
             items.append({"raw": raw, "sa_titlepair": (a, b)})
             continue
 
-        # NSW variant “77//DP753955” (explicit missing section)
+        # 6) NSW variant “77//DP753955” (explicit missing section)
         if "//" in raw:
             try:
                 left, right = raw.split("//", 1)
@@ -237,12 +241,13 @@ def parse_queries(multiline: str) -> List[Dict]:
                         "lot": lot,
                         "section": None,
                         "plan_type": m2.group(1).upper(),
-                        "plan_number": m2.group(2)
+                        "plan_number": m2.group(2),
                     })
                     continue
             except Exception:
                 pass
 
+        # If nothing matched, record it so the UI can warn instead of crashing
         items.append({"raw": raw, "unparsed": True})
     return items
 
@@ -315,6 +320,7 @@ def fetch_nsw(lot: str, plan_type: str, plan_number: str, section: Optional[str]
 def fetch_sa_by_planparcel(planparcel_str: str) -> Dict:
     """
     SA: planparcel exact match (e.g., D10001AL12)
+    Field: planparcel
     """
     url = ENDPOINTS["SA"]
     where = f"UPPER(planparcel)=UPPER('{planparcel_str}')"
@@ -323,6 +329,7 @@ def fetch_sa_by_planparcel(planparcel_str: str) -> Dict:
 def fetch_sa_by_title(volume: str, folio: str) -> Dict:
     """
     SA: title search by volume & folio exact match
+    Fields: volume, folio
     """
     url = ENDPOINTS["SA"]
     where = f"(UPPER(volume)=UPPER('{volume}')) AND (UPPER(folio)=UPPER('{folio}'))"
@@ -389,8 +396,8 @@ with st.sidebar:
 
     st.markdown("**Supported input formats:**")
     st.markdown(
-        "- **NSW/QLD:** `13/DP1242624`, `77//DP753955` (no section), `3SP181800`, `Lot 3 on Survey Plan 181800`\n"
-        "- **SA planparcel:** `D10001AL12`\n"
+        "- **NSW/QLD:** `13/DP1242624`, `77//DP753955` (no section), `3SP181800`, `Lot 3 on Survey Plan 181800`  \n"
+        "- **SA planparcel:** `D10001AL12`  \n"
         "- **SA title:** `FOLIO/VOLUME` or `VOLUME/FOLIO` (e.g., `1234/5678` or `5678/1234`)"
     )
 
@@ -514,7 +521,7 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                         for fc_try in (fc1, fc2):
                             for feat in fc_try.get("features", []):
                                 pid = (feat.get("properties") or {}).get("parcel_id") or json.dumps(feat.get("geometry", {}), sort_keys=True)
-                                if pid in seen: 
+                                if pid in seen:
                                     continue
                                 seen.add(pid)
                                 merged["features"].append(feat)
