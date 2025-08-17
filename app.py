@@ -1,9 +1,9 @@
-# app.py — MappingKML (NSW uses lotidstring; QLD + NSW + SA)
+# app.py — MappingKML (NSW via lotidstring on layer 9; QLD + SA supported)
 # --------------------------------------------------------------------------------------
-# NSW: type lotidstring like 13//DP1246224 (we query lotidstring directly)
+# NSW: input lotidstring like 13//DP1246224 (we query layer 9 field 'lotidstring' directly)
 # QLD: lot/plan formats (13/DP1242624, 77//DP753955, 3SP181800, Lot 3 on Survey Plan 181800)
 # SA:  planparcel like D10001AL12  OR title search "folio/volume" or "volume/folio" (e.g., 1234/5678)
-# Exports: GeoJSON / KML / KMZ — KML balloons show ALL attributes
+# Exports: GeoJSON / KML / KMZ — KML balloons list ALL attributes
 # --------------------------------------------------------------------------------------
 
 import io
@@ -33,8 +33,8 @@ ENDPOINTS = {
     # QLD Cadastre (adjust if your layer differs)
     "QLD": "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Cadastre/LandParcels/MapServer/0/query",
 
-    # NSW Cadastre (SIX Maps public layer) — we use lotidstring here
-    "NSW": "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/0/query",
+    # NSW Cadastre — use MapServer/9 (Lot layer); we query by 'lotidstring'
+    "NSW": "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/9/query",
 
     # SA Cadastre (Reference_WFL1 FeatureServer, Layer 1)
     "SA":  "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
@@ -187,7 +187,7 @@ def parse_queries(multiline: str) -> List[Dict]:
             items.append({"raw": raw, "nsw_lotid": m.group("lotid").upper()})
             continue
 
-        # QLD/NSW like 13/1/DP1242624 or 13/DP1242624
+        # QLD/NSW like 13/1/DP1242624 or 13/DP1242624 (for QLD)
         m = RE_LOTPLAN_SLASH.match(raw)
         if m:
             items.append({
@@ -199,7 +199,7 @@ def parse_queries(multiline: str) -> List[Dict]:
             })
             continue
 
-        # Compact like 3SP181800
+        # Compact like 3SP181800 (QLD)
         m = RE_COMPACT.match(raw)
         if m:
             items.append({
@@ -211,7 +211,7 @@ def parse_queries(multiline: str) -> List[Dict]:
             })
             continue
 
-        # Verbose like "Lot 3 on Survey Plan 181800"
+        # Verbose like "Lot 3 on Survey Plan 181800" (QLD)
         m = RE_VERBOSE.match(raw)
         if m:
             plan_type = "SP" if "Survey" in (m.group("plan_label") or "") else "RP"
@@ -237,7 +237,7 @@ def parse_queries(multiline: str) -> List[Dict]:
             items.append({"raw": raw, "sa_titlepair": (a, b)})
             continue
 
-        # NSW variant “77//DP753955” handled by RE_NSW_LOTID earlier.
+        # Nothing matched
         items.append({"raw": raw, "unparsed": True})
     return items
 
@@ -285,28 +285,68 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
         features.append({"type": "Feature", "geometry": geo, "properties": attrs})
     return {"type": "FeatureCollection", "features": features}
 
+# -------------------------- NSW helpers --------------------------
+
+def _nsw_normalize_lotid(raw: str) -> str:
+    """
+    Accepts '13//DP1246224', '13/DP1246224', '13 / DP1246224' and returns '13//DP1246224'.
+    """
+    s = (raw or "").strip().upper().replace(" ", "")
+    if "//" in s:
+        return s
+    m = re.match(r"^(?P<lot>\d+)/(?P<plan>[A-Z]{1,6}\d+)$", s)
+    return f"{m.group('lot')}//{m.group('plan')}" if m else s
+
+def fetch_nsw_by_lotid(lotid: str) -> Dict:
+    """
+    NSW robust search against layer 9:
+      1) lotidstring exact (lowercase field)
+      2) lotnumber + planlabel (lowercase fields)
+      3) planlabel only
+    """
+    url = ENDPOINTS["NSW"]
+    lotid_norm = _nsw_normalize_lotid(lotid)
+
+    # split for fallbacks
+    lot, planlabel = None, None
+    m = re.match(r"^(?P<lot>\d+)//(?P<plan>[A-Z]{1,6}\d+)$", lotid_norm)
+    if m:
+        lot, planlabel = m.group("lot"), m.group("plan")
+
+    # 1) lotidstring exact
+    fc1 = _arcgis_query(url, f"UPPER(lotidstring)=UPPER('{lotid_norm}')")
+    if fc1.get("features"):
+        for f in fc1["features"]:
+            (f.get("properties") or {}).update({"_match": "NSW lotidstring exact"})
+        return fc1
+
+    # 2) lotnumber + planlabel
+    if lot and planlabel:
+        fc2 = _arcgis_query(
+            url,
+            f"(UPPER(lotnumber)=UPPER('{lot}')) AND (UPPER(planlabel)=UPPER('{planlabel}'))"
+        )
+        if fc2.get("features"):
+            for f in fc2["features"]:
+                (f.get("properties") or {}).update({"_match": "NSW lotnumber+planlabel"})
+            return fc2
+
+    # 3) planlabel only (still shows plan if lot was wrong)
+    if planlabel:
+        fc3 = _arcgis_query(url, f"UPPER(planlabel)=UPPER('{planlabel}')")
+        for f in fc3.get("features", []):
+            (f.get("properties") or {}).update({"_match": "NSW plan only"})
+        return fc3
+
+    # Nothing matched
+    return {"type": "FeatureCollection", "features": []}
+
 # -------------------------- Per-state fetchers --------------------------
 
 def fetch_qld(lot: str, plan_type: str, plan_number: str) -> Dict:
     url = ENDPOINTS["QLD"]
     plan_full = f"{plan_type}{plan_number}"
     where = f"(UPPER(LOT)=UPPER('{lot}')) AND (UPPER(PLAN)=UPPER('{plan_full}'))"
-    return _arcgis_query(url, where)
-
-def fetch_nsw_by_lotid(lotid: str) -> Dict:
-    """
-    NSW: exact match on lotidstring (e.g., 13//DP1246224).
-    Field name is 'lotidstring' in this service; we do case-insensitive compare.
-    """
-    url = ENDPOINTS["NSW"]
-    # Use LOWER() or UPPER(); ArcGIS accepts either for string functions
-    where = f"UPPER(lotidstring)=UPPER('{lotid}')"
-    return _arcgis_query(url, where)
-
-def fetch_nsw_fallback_plan(plan_label: str) -> Dict:
-    """Optional helper: plan-only search if lotidstring returns nothing."""
-    url = ENDPOINTS["NSW"]
-    where = f"UPPER(planlabel)=UPPER('{plan_label}')"
     return _arcgis_query(url, where)
 
 def fetch_sa_by_planparcel(planparcel_str: str) -> Dict:
@@ -334,16 +374,16 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
     for feat in fc.get("features", []):
         props = (feat.get("properties") or {}).copy()
 
-        # Make a friendly name (prefer SA/NSW IDs, then NSW planlabel/QLD plan)
+        # Friendly name: prefer NSW/SA identifiers, else plan labels
         name = (
             props.get("lotidstring")
             or props.get("planparcel")
-            or props.get("PLAN_LABEL") or props.get("PLAN")
-            or props.get("planlabel") or props.get("plan")
+            or props.get("planlabel") or props.get("PLAN_LABEL")
+            or props.get("PLAN") or props.get("plan")
             or "parcel"
         )
 
-        # Build a verbose description listing *all* attributes
+        # Verbose description listing *all* attributes
         lines = []
         for k, v in sorted(props.items(), key=lambda kv: kv[0].lower()):
             if v not in (None, ""):
@@ -448,14 +488,14 @@ def _warn_wrong_state(pt: str, state: str) -> Optional[str]:
 
 if run_btn and (sel_qld or sel_nsw or sel_sa):
     with st.spinner("Querying selected states..."):
-        # NSW (lotidstring direct)
+        # NSW (lotidstring direct on layer 9)
         if sel_nsw:
             for p in parsed:
                 if p.get("unparsed"):
                     continue
                 try:
                     if "nsw_lotid" in p:
-                        lotid = p["nsw_lotid"]
+                        lotid = _nsw_normalize_lotid(p["nsw_lotid"])
                         fc = fetch_nsw_by_lotid(lotid)
                         c = len(fc.get("features", []))
                         state_counts["NSW"] += c
@@ -558,12 +598,14 @@ if accum_features:
         )
     )
 
+# Tooltip: NSW uses lowercase keys (lotidstring, planlabel, lotnumber, sectionnumber)
 tooltip_html = """
 <div style="font-family:Arial,sans-serif;">
-  <b>{planlabel}</b> <b>{PLAN_LABEL}</b><br/>
+  <b>{planlabel}</b><br/>
   LotID: <b>{lotidstring}</b><br/>
-  Lot {LOT_NUMBER}{sectionnumber} | Plan {PLAN} {planparcel}<br/>
-  SA Title: Vol {volume} / Fol {folio}
+  Lot {lotnumber}{sectionnumber}<br/>
+  SA Title: Vol {volume} / Fol {folio}<br/>
+  <small style="opacity:.7;">{_match}</small>
 </div>
 """
 
