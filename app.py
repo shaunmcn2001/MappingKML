@@ -19,6 +19,24 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
+# =========================
+# Regex definitions
+# =========================
+
+# Compact format (e.g. 3SP181800, 1//DP12345)
+RE_COMPACT = re.compile(
+    r"^(?P<lot>\d+)[/]{0,2}(?P<plan_type>[A-Z]+)(?P<plan_number>\d+)$",
+    re.IGNORECASE
+)
+
+# Verbose format (e.g. "Lot 3 on Survey Plan 181800")
+RE_VERBOSE = re.compile(
+    r"Lot\s+(?P<lot>\d+)\s+on\s+"
+    r"(?P<plan_type>Registered Plan|Survey Plan|Deposited Plan)\s+"
+    r"(?P<plan_number>\d+)",
+    re.IGNORECASE
+)
+
 # Optional: enable KML/KMZ export if simplekml is installed
 try:
     import simplekml
