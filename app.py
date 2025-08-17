@@ -32,14 +32,9 @@ st.set_page_config(page_title="MappingKML", layout="wide")
 
 # ArcGIS REST endpoints
 ENDPOINTS = {
-    # QLD Cadastre (adjust if your layer differs)
     "QLD": "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Cadastre/LandParcels/MapServer/0/query",
-
-    # NSW Cadastre (SIX Maps public layer)
     "NSW": "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_Cadastre/MapServer/0/query",
-
-    # SA Cadastre (Reference_WFL1 FeatureServer, Layer 1)
-    "SA": "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
+    "SA":  "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
 }
 
 # Default east-AU view fallback
@@ -154,7 +149,6 @@ def _fit_view(fc_like, warn_if_empty=True):
 
 # -------------------------- Input parsing (SAFE) --------------------------
 
-# NSW/QLD patterns
 RE_LOTPLAN_SLASH = re.compile(
     r"^\s*(?P<lot>\d+)\s*(?:/(?P<section>\d+))?\s*/\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$"
 )
@@ -166,17 +160,11 @@ RE_VERBOSE = re.compile(
     re.IGNORECASE
 )
 
-# SA patterns
-# planparcel like D10001AL12  (letters+digits+letters+digits; accept 1–2 letters each group)
 RE_SA_PLANPARCEL = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
-# title pair two integers with slash, any order: folio/volume OR volume/folio
 RE_SA_TITLEPAIR  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
 
 def parse_queries(multiline: str) -> List[Dict]:
-    """
-    Return a list of parsed query dicts.
-    Never references undefined variables, never raises NameError on bad lines.
-    """
+    """Never references undefined variables; unparsed lines are marked safely."""
     items: List[Dict] = []
     lines = [x.strip() for x in (multiline or "").splitlines() if x.strip()]
 
@@ -303,14 +291,12 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
 def fetch_qld(lot: str, plan_type: str, plan_number: str) -> Dict:
     url = ENDPOINTS["QLD"]
     plan_full = f"{plan_type}{plan_number}"
-    # Common QLD fields: LOT, PLAN (PLAN contains type, e.g., RP123456)
     where = f"(UPPER(LOT)=UPPER('{lot}')) AND (UPPER(PLAN)=UPPER('{plan_full}'))"
     return _arcgis_query(url, where)
 
 def fetch_nsw(lot: str, plan_type: str, plan_number: str, section: Optional[str] = None) -> Dict:
     url = ENDPOINTS["NSW"]
     plan_full = f"{plan_type}{plan_number}"
-    # Common NSW fields: LOT_NUMBER, SECTION_NUMBER, PLAN_LABEL
     if section:
         where = (
             f"(UPPER(LOT_NUMBER)=UPPER('{lot}')) AND (UPPER(SECTION_NUMBER)=UPPER('{section}')) "
@@ -320,22 +306,12 @@ def fetch_nsw(lot: str, plan_type: str, plan_number: str, section: Optional[str]
         where = f"(UPPER(LOT_NUMBER)=UPPER('{lot}')) AND (UPPER(PLAN_LABEL)=UPPER('{plan_full}'))"
     return _arcgis_query(url, where)
 
-# ----- SA fetchers -----
-
 def fetch_sa_by_planparcel(planparcel_str: str) -> Dict:
-    """
-    SA: planparcel exact match (e.g., D10001AL12)
-    Field: planparcel
-    """
     url = ENDPOINTS["SA"]
     where = f"UPPER(planparcel)=UPPER('{planparcel_str}')"
     return _arcgis_query(url, where)
 
 def fetch_sa_by_title(volume: str, folio: str) -> Dict:
-    """
-    SA: title search by volume & folio exact match
-    Fields: volume, folio
-    """
     url = ENDPOINTS["SA"]
     where = f"(UPPER(volume)=UPPER('{volume}')) AND (UPPER(folio)=UPPER('{folio}'))"
     return _arcgis_query(url, where)
@@ -508,7 +484,6 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 if p.get("unparsed"):
                     continue
                 try:
-                    # Planparcel search
                     if "sa_planparcel" in p:
                         fc = fetch_sa_by_planparcel(p["sa_planparcel"])
                         c = len(fc.get("features", []))
@@ -518,16 +493,17 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                         _add_features(fc)
                         continue
 
-                    # Title search (folio/volume OR volume/folio) — try both orders, union results.
                     if "sa_titlepair" in p:
                         a, b = p["sa_titlepair"]
                         fc1 = fetch_sa_by_title(volume=a, folio=b)  # assume a=volume, b=folio
-                        fc2 = fetch_sa_by_title(volume=b, folio=a)  # assume b=volume, a=folio
+                        fc2 = fetch_sa_by_title(volume=b, folio=a)  # and b=volume, a=folio
                         seen = set()
                         merged = {"type": "FeatureCollection", "features": []}
                         for fc_try in (fc1, fc2):
                             for feat in fc_try.get("features", []):
-                                pid = (feat.get("properties") or {}).get("parcel_id") or json.dumps(feat.get("geometry", {}), sort_keys=True)
+                                pid = (feat.get("properties") or {}).get("parcel_id") or json.dumps(
+                                    feat.get("geometry", {}), sort_keys=True
+                                )
                                 if pid in seen:
                                     continue
                                 seen.add(pid)
@@ -535,11 +511,11 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                         c = len(merged["features"])
                         state_counts["SA"] += c
                         if c == 0:
-                            state_warnings.append(f"SA: No parcels for title inputs '{a}/{b}'. (Tried both volume/folio and folio/volume.)")
+                            state_warnings.append(
+                                f"SA: No parcels for title inputs '{a}/{b}'. (Tried both volume/folio and folio/volume.)"
+                            )
                         _add_features(merged)
                         continue
-
-                    # Ignore NSW/QLD style lines for SA
                 except Exception as e:
                     state_warnings.append(f"SA error for {p.get('raw')}: {e}")
 
@@ -570,7 +546,6 @@ if accum_features:
         )
     )
 
-# Keep tooltip robust (keys may not exist on every state)
 tooltip_html = """
 <div style="font-family:Arial,sans-serif;">
   <b>{PLAN_LABEL}</b><br/>
