@@ -1,8 +1,8 @@
 # app.py — MappingKML
-# NSW: layer 9, query ONLY by lotidstring (e.g. 13//DP1246224), no SQL functions
-# QLD: lot + plan
-# SA : planparcel or title (volume/folio in any order)
-# Exports: GeoJSON, KML, KMZ (Google Earth balloons show ALL attributes)
+# NSW: layer 9, query ONLY by lotidstring (e.g. 13//DP1246224); supports separate BULK mode (parallel).
+# QLD: lot + plan (unchanged)
+# SA : planparcel OR title (volume/folio in any order) (unchanged)
+# Exports: GeoJSON / KML / KMZ — Google Earth balloons show ALL attributes.
 
 import io
 import json
@@ -12,6 +12,7 @@ import time
 import zipfile
 from typing import Dict, List, Optional, Tuple
 
+import concurrent.futures
 import requests
 import streamlit as st
 import pydeck as pdk
@@ -23,6 +24,8 @@ try:
 except Exception:
     HAVE_SIMPLEKML = False
 
+# --------------------- App Config ---------------------
+
 st.set_page_config(page_title="MappingKML", layout="wide")
 
 ENDPOINTS = {
@@ -31,13 +34,17 @@ ENDPOINTS = {
     "SA":  "https://dpti.geohub.sa.gov.au/server/rest/services/Hosted/Reference_WFL1/FeatureServer/1/query",
 }
 
-DEFAULT_VIEW = pdk.ViewState(latitude=-32.0, longitude=147.0, zoom=5)
+DEFAULT_VIEW = pdk.ViewState(latitude=-24.8, longitude=134.0, zoom=4.6, pitch=0, bearing=0)
 
 # Keep UI responsive
 REQUEST_TIMEOUT = 12
 REQUEST_RETRIES = 0
+MAX_WORKERS_NSW = 6  # parallel NSW bulk fetches
 
-# ---------- geometry helpers ----------
+SESSION = requests.Session()  # TCP reuse
+
+# --------------------- Geometry Helpers ---------------------
+
 def _as_fc(fc_like):
     if fc_like is None: return None
     if isinstance(fc_like, str):
@@ -48,7 +55,8 @@ def _as_fc(fc_like):
     if t == "FeatureCollection":
         feats = fc_like.get("features", [])
         return {"type":"FeatureCollection","features":feats if isinstance(feats, list) else []}
-    if t == "Feature": return {"type":"FeatureCollection","features":[fc_like]}
+    if t == "Feature":
+        return {"type":"FeatureCollection","features":[fc_like]}
     if t in {"Point","MultiPoint","LineString","MultiLineString","Polygon","MultiPolygon"}:
         return {"type":"FeatureCollection","features":[{"type":"Feature","geometry":fc_like,"properties":{}}]}
     return None
@@ -71,11 +79,13 @@ def _iter_coords(geom):
                     if isinstance(p,(list,tuple)) and len(p)>=2: yield p[:2]
 
 def _geom_bbox(geom):
-    minx=miny=math.inf; maxx=maxy=-math.inf; f=False
+    minx=miny=math.inf; maxx=maxy=-math.inf; found=False
     for x,y in _iter_coords(geom):
         if not (isinstance(x,(int,float)) and isinstance(y,(int,float))): continue
-        f=True; minx=min(minx,x); maxx=max(maxx,x); miny=min(miny,y); maxy=max(maxy,y)
-    return (minx,miny,maxx,maxy) if f else None
+        found=True
+        minx=min(minx,x); maxx=max(maxx,x)
+        miny=min(miny,y); maxy=max(maxy,y)
+    return (minx,miny,maxx,maxy) if found else None
 
 def _merge_bbox(b1,b2):
     if b1 is None: return b2
@@ -90,38 +100,43 @@ def _bbox_to_viewstate(bbox, pad=0.12):
     cx=(minx+maxx)/2; cy=(miny+maxy)/2
     extent=max(maxx-minx,maxy-miny)
     if extent<=0 or not math.isfinite(extent): return pdk.ViewState(latitude=cy,longitude=cx,zoom=14)
-    zoom=13
-    if extent>20: zoom=5
-    elif extent>10: zoom=6
-    elif extent>5: zoom=7
-    elif extent>2: zoom=8
-    elif extent>1: zoom=9
-    elif extent>0.5: zoom=10
-    elif extent>0.25: zoom=11
-    elif extent>0.1: zoom=12
-    return pdk.ViewState(latitude=cy,longitude=cx,zoom=zoom)
+    if extent > 20: zoom = 5
+    elif extent > 10: zoom = 6
+    elif extent > 5: zoom = 7
+    elif extent > 2: zoom = 8
+    elif extent > 1: zoom = 9
+    elif extent > 0.5: zoom = 10
+    elif extent > 0.25: zoom = 11
+    elif extent > 0.1: zoom = 12
+    else: zoom = 13
+    return pdk.ViewState(latitude=cy, longitude=cx, zoom=zoom)
 
 def _fit_view(fc_like):
     fc=_as_fc(fc_like)
     if not fc or not fc.get("features"):
-        st.warning("No features to display. Showing default view.", icon="⚠️")
         return DEFAULT_VIEW
     bbox=None
     for f in fc["features"]:
         bbox=_merge_bbox(bbox,_geom_bbox(f.get("geometry") or {}))
-    if bbox is None:
-        st.warning("Features had no valid coordinates. Showing default view.", icon="⚠️")
-        return DEFAULT_VIEW
     return _bbox_to_viewstate(bbox)
 
-# ---------- parsing ----------
+# --------------------- Parsing ---------------------
+
+# NSW lotidstring OR one-slash; normalized to LOT//PLAN (uppercase)
 RE_NSW_LOTID = re.compile(r"^\s*(?P<lotid>\d+//[A-Za-z]{1,6}\d+)\s*$")
 RE_NSW_ONE_SLASH = re.compile(r"^\s*(?P<lot>\d+)\s*/\s*(?P<plan>[A-Za-z]{1,6}\d+)\s*$")
 
-RE_LOTPLAN_SLASH = re.compile(r"^\s*(?P<lot>\d+)\s*(?:/(?P<section>\d+))?\s*/\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$")
+# QLD
+RE_LOTPLAN_SLASH = re.compile(
+    r"^\s*(?P<lot>\d+)\s*(?:/(?P<section>\d+))?\s*/\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$"
+)
 RE_COMPACT = re.compile(r"^\s*(?P<lot>\d+)\s*(?P<plan_type>[A-Za-z]{1,6})\s*(?P<plan_number>\d+)\s*$")
-RE_VERBOSE = re.compile(r"^\s*Lot\s+(?P<lot>\d+)\s+on\s+(?P<plan_label>(Registered|Survey)\s+Plan)\s+(?P<plan_number>\d+)\s*$", re.IGNORECASE)
+RE_VERBOSE = re.compile(
+    r"^\s*Lot\s+(?P<lot>\d+)\s+on\s+(?P<plan_label>(Registered|Survey)\s+Plan)\s+(?P<plan_number>\d+)\s*$",
+    re.IGNORECASE
+)
 
+# SA
 RE_SA_PLANPARCEL = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
 RE_SA_TITLEPAIR  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
 
@@ -163,18 +178,20 @@ def parse_queries(multiline: str) -> List[Dict]:
         items.append({"raw":raw,"unparsed":True})
     return items
 
-# ---------- HTTP / ArcGIS ----------
+# --------------------- HTTP / ArcGIS ---------------------
+
 def _http_get_json(url: str, params: Dict, retries: int = REQUEST_RETRIES, timeout: int = REQUEST_TIMEOUT) -> Dict:
     last=None
     for attempt in range(retries+1):
         try:
+            # Keep responses lean/safe by default; caller can override fields.
             base=dict(f="json", outSR=4326, returnGeometry="true", geometryPrecision=6, returnExceededLimitFeatures="false")
-            r = requests.get(url, params={**base, **params}, timeout=timeout)
+            r = SESSION.get(url, params={**base, **params}, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last=e
-            if attempt<retries: time.sleep(0.5)
+            if attempt<retries: time.sleep(0.4)
     raise last if last else RuntimeError("Unknown request error")
 
 def _arcgis_to_fc(data: Dict) -> Dict:
@@ -197,20 +214,7 @@ def _arcgis_query(url: str, where: str, out_fields: str = "*") -> Dict:
     data = _http_get_json(url, {"where": where, "outFields": out_fields})
     return _arcgis_to_fc(data)
 
-# ---------- fetchers ----------
-def fetch_nsw_by_lotidstring(lotid: str) -> Dict:
-    """
-    NSW layer 9: lotidstring exact match (no SQL functions).
-    We normalize input to upper + double slash, but send plain equality.
-    """
-    url = ENDPOINTS["NSW"]
-    lotid_norm = _nsw_normalize_lotid(lotid)
-    params = {
-        "where": f"lotidstring='{lotid_norm}'",
-        "outFields": "*",
-    }
-    data = _http_get_json(url, params, timeout=REQUEST_TIMEOUT, retries=REQUEST_RETRIES)
-    return _arcgis_to_fc(data)
+# --------------------- Fetchers ---------------------
 
 def fetch_qld(lot: str, plan_type: str, plan_number: str) -> Dict:
     url = ENDPOINTS["QLD"]
@@ -228,7 +232,61 @@ def fetch_sa_by_title(volume: str, folio: str) -> Dict:
     where = f"(volume='{volume}') AND (folio='{folio}')"
     return _arcgis_query(url, where)
 
-# ---------- exports ----------
+# ----- NSW one-shot (single) & bulk (parallel) by lotidstring -----
+
+def nsw_fetch_one(lotid: str) -> Dict:
+    """
+    NSW layer 9: one-shot geometry + attributes via lotidstring exact match.
+    No SQL functions in WHERE (layer 9 does not support them).
+    """
+    url = ENDPOINTS["NSW"]
+    lotid_norm = _nsw_normalize_lotid(lotid)
+    params = {
+        "where": f"lotidstring='{lotid_norm}'",
+        "outFields": "*",
+    }
+    data = _http_get_json(url, params, timeout=REQUEST_TIMEOUT, retries=REQUEST_RETRIES)
+    return _arcgis_to_fc(data)
+
+def nsw_fetch_bulk(lotids: List[str], max_workers: int = MAX_WORKERS_NSW) -> Dict:
+    """Parallel NSW fetch by lotidstring list; merges features and de-dups."""
+    lotids_norm = [ _nsw_normalize_lotid(x) for x in lotids if x and x.strip() ]
+    if not lotids_norm:
+        return {"type":"FeatureCollection","features":[]}
+
+    features: List[Dict] = []
+    errors: List[str] = []
+
+    def _task(lid: str):
+        try:
+            return lid, nsw_fetch_one(lid)
+        except Exception as e:
+            return lid, {"error": str(e)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for lid, res in ex.map(_task, lotids_norm):
+            if "error" in res:
+                errors.append(f"{lid}: {res['error']}")
+            else:
+                features.extend(res.get("features", []))
+
+    if errors:
+        st.warning("NSW bulk had issues:\n- " + "\n- ".join(errors[:10]), icon="⚠️")
+        if len(errors) > 10:
+            st.caption(f"... plus {len(errors) - 10} more errors.")
+
+    # de-dup (by objectid + lotidstring)
+    seen = set(); unique_feats = []
+    for f in features:
+        props = f.get("properties") or {}
+        sig = (props.get("objectid"), props.get("lotidstring"))
+        if sig not in seen:
+            seen.add(sig); unique_feats.append(f)
+
+    return {"type": "FeatureCollection", "features": unique_feats}
+
+# --------------------- Exports ---------------------
+
 def features_to_geojson(fc: Dict) -> bytes:
     return json.dumps(fc, ensure_ascii=False).encode("utf-8")
 
@@ -276,7 +334,8 @@ def features_to_kml_kmz(fc: Dict, as_kmz: bool = False) -> Tuple[str, bytes]:
     else:
         return ("application/vnd.google-earth.kml+xml", kml.kml().encode("utf-8"))
 
-# ---------- UI ----------
+# --------------------- UI ---------------------
+
 st.title("MappingKML — Parcel Finder")
 
 with st.sidebar:
@@ -292,6 +351,17 @@ with st.sidebar:
         "- **SA:** `D10001AL12`  •  `FOLIO/VOLUME` or `VOLUME/FOLIO` (e.g., `1234/5678`)"
     )
 
+    st.markdown("---")
+    nsw_bulk_mode = st.checkbox("NSW bulk mode (lotidstring list)", value=False)
+    if nsw_bulk_mode:
+        nsw_bulk_text = st.text_area(
+            "NSW lotidstrings (one per line or comma-separated)",
+            height=140,
+            placeholder="13//DP1246224\n12//DP1246224\n101//DP123456\n..."
+        )
+    else:
+        nsw_bulk_text = ""
+
 examples = (
     "13//DP1246224  # NSW lotidstring\n"
     "13/DP1242624   # QLD\n"
@@ -299,7 +369,7 @@ examples = (
     "D10001AL12     # SA planparcel\n"
     "1234/5678      # SA title\n"
 )
-queries_text = st.text_area("Enter one query per line", height=170, placeholder=examples)
+queries_text = st.text_area("Enter one query per line (for QLD/SA and NSW per-line)", height=170, placeholder=examples)
 
 c1, c2 = st.columns([1,1])
 with c1: run_btn = st.button("Search", type="primary")
@@ -324,29 +394,48 @@ def _add_features(fc):
     for f in (fc or {}).get("features", []):
         accum_features.append(f)
 
-# ---------- run ----------
+# --------------------- Run ---------------------
+
 if run_btn and (sel_qld or sel_nsw or sel_sa):
     with st.spinner("Querying selected states..."):
 
-        # NSW — lotidstring ONLY
+        # --- NSW (separate bulk mode or per-line) ---
         if sel_nsw:
-            for p in parsed:
-                if p.get("unparsed"): continue
-                if "nsw_lotid" in p:
-                    lotid = _nsw_normalize_lotid(p["nsw_lotid"])
-                    st.caption(f"NSW where: lotidstring='{lotid}'")
-                    try:
-                        fc = fetch_nsw_by_lotidstring(lotid)
-                    except requests.exceptions.Timeout:
-                        state_warnings.append("NSW request timed out.")
-                        fc = {"type":"FeatureCollection","features":[]}
-                    c = len(fc.get("features", []))
-                    state_counts["NSW"] += c
-                    if c == 0:
-                        state_warnings.append(f"NSW: No parcels for lotidstring '{lotid}'.")
-                    _add_features(fc)
+            if nsw_bulk_mode and nsw_bulk_text.strip():
+                raw_items = [x.strip() for part in nsw_bulk_text.splitlines() for x in part.split(",")]
+                lotids = [x for x in raw_items if x]
+                st.caption(f"NSW bulk: {len(lotids)} lotidstring(s)")
+                fc_bulk = nsw_fetch_bulk(lotids)
+                c = len(fc_bulk.get("features", []))
+                state_counts["NSW"] += c
+                if c == 0:
+                    st.warning("NSW bulk: no parcels found.", icon="⚠️")
+                else:
+                    st.success(f"NSW bulk: found {c} feature(s).")
+                _add_features(fc_bulk)
+            else:
+                # Per-line NSW via parsed entries
+                for p in parsed:
+                    if p.get("unparsed"): 
+                        continue
+                    if "nsw_lotid" in p:
+                        lotid = _nsw_normalize_lotid(p["nsw_lotid"])
+                        st.caption(f"NSW where: lotidstring='{lotid}'")
+                        try:
+                            fc = nsw_fetch_one(lotid)
+                        except requests.exceptions.Timeout:
+                            state_warnings.append("NSW request timed out.")
+                            fc = {"type":"FeatureCollection","features":[]}
+                        except Exception as e:
+                            state_warnings.append(f"NSW error for {p.get('raw')}: {e}")
+                            fc = {"type":"FeatureCollection","features":[]}
+                        c = len(fc.get("features", []))
+                        state_counts["NSW"] += c
+                        if c == 0:
+                            state_warnings.append(f"NSW: No parcels for lotidstring '{lotid}'.")
+                        _add_features(fc)
 
-        # QLD
+        # --- QLD (unchanged) ---
         if sel_qld:
             for p in parsed:
                 if p.get("unparsed") or p.get("nsw_lotid") or p.get("sa_planparcel") or p.get("sa_titlepair"):
@@ -358,22 +447,29 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                     except requests.exceptions.Timeout:
                         state_warnings.append("QLD request timed out.")
                         fc = {"type":"FeatureCollection","features":[]}
+                    except Exception as e:
+                        state_warnings.append(f"QLD error for {p.get('raw')}: {e}")
+                        fc = {"type":"FeatureCollection","features":[]}
                     c = len(fc.get("features", []))
                     state_counts["QLD"] += c
                     if c == 0:
                         state_warnings.append(f"QLD: No parcels for lot '{p.get('lot')}', plan '{pt}{p.get('plan_number')}'.")
                     _add_features(fc)
 
-        # SA
+        # --- SA (unchanged) ---
         if sel_sa:
             for p in parsed:
-                if p.get("unparsed"): continue
+                if p.get("unparsed"): 
+                    continue
                 try:
                     if "sa_planparcel" in p:
                         fc = fetch_sa_by_planparcel(p["sa_planparcel"])
-                        c = len(fc.get("features", [])); state_counts["SA"] += c
-                        if c == 0: state_warnings.append(f"SA: No parcels for planparcel '{p['sa_planparcel']}'.")
-                        _add_features(fc); continue
+                        c = len(fc.get("features", []))
+                        state_counts["SA"] += c
+                        if c == 0:
+                            state_warnings.append(f"SA: No parcels for planparcel '{p['sa_planparcel']}'.")
+                        _add_features(fc); 
+                        continue
 
                     if "sa_titlepair" in p:
                         a,b = p["sa_titlepair"]
@@ -383,26 +479,42 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                         for fc_try in (fc1, fc2):
                             for feat in fc_try.get("features", []):
                                 pid = (feat.get("properties") or {}).get("parcel_id") or json.dumps(feat.get("geometry", {}), sort_keys=True)
-                                if pid in seen: continue
+                                if pid in seen: 
+                                    continue
                                 seen.add(pid); merged["features"].append(feat)
-                        c=len(merged["features"]); state_counts["SA"]+=c
-                        if c == 0: state_warnings.append(f"SA: No parcels for title inputs '{a}/{b}'. (Tried both volume/folio and folio/volume.)")
+                        c = len(merged["features"]); state_counts["SA"] += c
+                        if c == 0:
+                            state_warnings.append(f"SA: No parcels for title inputs '{a}/{b}'. (Tried both volume/folio and folio/volume.)")
                         _add_features(merged)
                 except requests.exceptions.Timeout:
                     state_warnings.append("SA request timed out.")
+                except Exception as e:
+                    state_warnings.append(f"SA error for {p.get('raw')}: {e}")
 
-# ---------- map ----------
+# --------------------- Map ---------------------
+
 fc_all = {"type":"FeatureCollection","features":accum_features}
 
 if state_warnings:
-    for w in state_warnings: st.warning(w, icon="⚠️")
+    for w in state_warnings:
+        st.warning(w, icon="⚠️")
 
 if run_btn and (sel_qld or sel_nsw or sel_sa):
     st.success(f"Found — NSW: {state_counts['NSW']}  |  QLD: {state_counts['QLD']}  |  SA: {state_counts['SA']}")
 
 layers=[]
 if accum_features:
-    layers.append(pdk.Layer("GeoJsonLayer", fc_all, pickable=True, stroked=True, filled=True, wireframe=True, get_line_width=2))
+    layers.append(
+        pdk.Layer(
+            "GeoJsonLayer",
+            fc_all,
+            pickable=True,
+            stroked=True,
+            filled=True,
+            wireframe=True,
+            get_line_width=2,
+        )
+    )
 
 tooltip_html = """
 <div style="font-family:Arial,sans-serif;">
@@ -417,7 +529,8 @@ view_state=_fit_view(fc_all if accum_features else None)
 deck=pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip={"html":tooltip_html})
 st.pydeck_chart(deck, use_container_width=True)
 
-# ---------- downloads ----------
+# --------------------- Downloads ---------------------
+
 st.subheader("Downloads")
 d1,d2,d3=st.columns(3)
 
