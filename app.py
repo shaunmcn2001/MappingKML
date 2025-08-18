@@ -16,6 +16,7 @@ import concurrent.futures
 import requests
 import streamlit as st
 import pydeck as pdk
+from kml_utils import generate_shapefile
 
 # Optional KML export
 try:
@@ -653,26 +654,63 @@ st.pydeck_chart(deck, use_container_width=True)
 # --------------------- Downloads ---------------------
 
 st.subheader("Downloads")
-d1,d2,d3=st.columns(3)
+d1, d2, d3, d4 = st.columns(4)
 
 with d1:
-    if accum_features:
-        st.download_button("⬇️ GeoJSON", data=features_to_geojson(fc_all), file_name="parcels.geojson", mime="application/geo+json")
-    else:
-        st.caption("No features yet.")
+    geojson_data = features_to_geojson(fc_all) if accum_features else None
+    st.download_button(
+        label="Download GeoJSON",
+        data=geojson_data,
+        file_name="parcels.geojson",
+        mime="application/geo+json",
+        type="secondary",
+        use_container_width=True,
+        disabled=not bool(geojson_data),
+    )
 
 with d2:
+    kml_bytes = None
     if HAVE_SIMPLEKML and accum_features:
-        mime, kml_data = features_to_kml_kmz(fc_all, as_kmz=False)
-        st.download_button("⬇️ KML", data=kml_data, file_name="parcels.kml", mime=mime)
-    elif not HAVE_SIMPLEKML:
+        _, kml_bytes = features_to_kml_kmz(fc_all, as_kmz=False)
+    st.download_button(
+        label="Download KML",
+        data=kml_bytes,
+        file_name="parcels.kml",
+        mime="application/vnd.google-earth.kml+xml",
+        type="primary",
+        use_container_width=True,
+        disabled=not bool(kml_bytes),
+    )
+    if not HAVE_SIMPLEKML:
         st.caption("Install `simplekml` for KML/KMZ: pip install simplekml")
-    else:
-        st.caption("No features yet.")
 
 with d3:
+    kmz_bytes = None
     if HAVE_SIMPLEKML and accum_features:
-        mime, kmz_data = features_to_kml_kmz(fc_all, as_kmz=True)
-        st.download_button("⬇️ KMZ", data=kmz_data, file_name="parcels.kmz", mime="application/vnd.google-earth.kmz")
-    else:
-        st.caption(" ")
+        _, kmz_bytes = features_to_kml_kmz(fc_all, as_kmz=True)
+    st.download_button(
+        label="Download KMZ",
+        data=kmz_bytes,
+        file_name="parcels.kmz",
+        mime="application/vnd.google-earth.kmz",
+        type="secondary",
+        use_container_width=True,
+        disabled=not bool(kmz_bytes),
+    )
+
+with d4:
+    shp_zip = None
+    if accum_features:
+        try:
+            shp_zip = generate_shapefile(accum_features, "MULTI")
+        except Exception:
+            shp_zip = None
+    st.download_button(
+        label="Download Shapefile (.zip)",
+        data=shp_zip,
+        file_name="parcels_shapefile.zip",
+        mime="application/zip",
+        type="secondary",
+        use_container_width=True,
+        disabled=not bool(shp_zip),
+    )
