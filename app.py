@@ -651,6 +651,23 @@ view_state=_fit_view(fc_all if accum_features else None)
 deck=pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip={"html":tooltip_html})
 st.pydeck_chart(deck, use_container_width=True)
 
+# --- minimal helper to ensure Streamlit always gets raw bytes ---
+def _as_bytes(x):
+    try:
+        if x is None:
+            return b""
+        if isinstance(x, (bytes, bytearray)):
+            return bytes(x)
+        if hasattr(x, "getvalue"):
+            return x.getvalue()
+        if isinstance(x, memoryview):
+            return x.tobytes()
+        if isinstance(x, str):
+            return x.encode("utf-8")
+        return b""
+    except Exception:
+        return b""
+
 # --------------------- Downloads ---------------------
 
 st.subheader("Downloads")
@@ -676,11 +693,7 @@ with d2:
         except Exception as e:
             kml_bytes = b""
             st.error(f"KML export error: {e}")
-    # Normalize to raw bytes for Streamlit (avoid dict/obj -> RuntimeError)
-    _kml_data = (
-        kml_bytes.getvalue() if hasattr(kml_bytes, "getvalue")
-        else (bytes(kml_bytes) if isinstance(kml_bytes, (bytes, bytearray)) else b"")
-    )
+    _kml_data = _as_bytes(kml_bytes)
     st.download_button(
         label="Download KML",
         data=_kml_data,
@@ -715,11 +728,7 @@ with d4:
         except Exception as e:
             shp_zip = b""
             st.error(f"Shapefile export error: {e}")
-    # Normalize to raw bytes for Streamlit
-    _shp_data = (
-        shp_zip.getvalue() if hasattr(shp_zip, "getvalue")
-        else (bytes(shp_zip) if isinstance(shp_zip, (bytes, bytearray)) else b"")
-    )
+    _shp_data = _as_bytes(shp_zip)
     st.download_button(
         label="Download Shapefile (.zip)",
         data=_shp_data,
