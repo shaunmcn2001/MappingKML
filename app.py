@@ -16,7 +16,6 @@ import concurrent.futures
 import requests
 import streamlit as st
 import pydeck as pdk
-from kml_utils import generate_shapefile
 
 # Optional KML export
 try:
@@ -651,90 +650,29 @@ view_state=_fit_view(fc_all if accum_features else None)
 deck=pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip={"html":tooltip_html})
 st.pydeck_chart(deck, use_container_width=True)
 
-# --- minimal helper to ensure Streamlit always gets raw bytes ---
-def _as_bytes(x):
-    try:
-        if x is None:
-            return b""
-        if isinstance(x, (bytes, bytearray)):
-            return bytes(x)
-        if hasattr(x, "getvalue"):
-            return x.getvalue()
-        if isinstance(x, memoryview):
-            return x.tobytes()
-        if isinstance(x, str):
-            return x.encode("utf-8")
-        return b""
-    except Exception:
-        return b""
-
 # --------------------- Downloads ---------------------
 
 st.subheader("Downloads")
-d1, d2, d3, d4 = st.columns(4)
+d1,d2,d3=st.columns(3)
 
 with d1:
-    geojson_data = features_to_geojson(fc_all) if accum_features else None
-    st.download_button(
-        label="Download GeoJSON",
-        data=geojson_data,
-        file_name="parcels.geojson",
-        mime="application/geo+json",
-        type="secondary",
-        use_container_width=True,
-        disabled=not bool(geojson_data),
-    )
+    if accum_features:
+        st.download_button("⬇️ GeoJSON", data=features_to_geojson(fc_all), file_name="parcels.geojson", mime="application/geo+json")
+    else:
+        st.caption("No features yet.")
 
 with d2:
-    kml_bytes = b""
     if HAVE_SIMPLEKML and accum_features:
-        try:
-            _, kml_bytes = features_to_kml_kmz(fc_all, as_kmz=False)
-        except Exception as e:
-            kml_bytes = b""
-            st.error(f"KML export error: {e}")
-    _kml_data = _as_bytes(kml_bytes)
-    st.download_button(
-        label="Download KML",
-        data=_kml_data,
-        file_name="parcels.kml",
-        mime="application/vnd.google-earth.kml+xml",
-        type="primary",
-        use_container_width=True,
-        disabled=not bool(_kml_data),
-    )
-    if not HAVE_SIMPLEKML:
+        mime, kml_data = features_to_kml_kmz(fc_all, as_kmz=False)
+        st.download_button("⬇️ KML", data=kml_data, file_name="parcels.kml", mime=mime)
+    elif not HAVE_SIMPLEKML:
         st.caption("Install `simplekml` for KML/KMZ: pip install simplekml")
+    else:
+        st.caption("No features yet.")
 
 with d3:
-    kmz_bytes = None
     if HAVE_SIMPLEKML and accum_features:
-        _, kmz_bytes = features_to_kml_kmz(fc_all, as_kmz=True)
-    st.download_button(
-        label="Download KMZ",
-        data=kmz_bytes,
-        file_name="parcels.kmz",
-        mime="application/vnd.google-earth.kmz",
-        type="secondary",
-        use_container_width=True,
-        disabled=not bool(kmz_bytes),
-    )
-
-with d4:
-    shp_zip = b""
-    if accum_features:
-        try:
-            shp_zip = generate_shapefile(accum_features, "MULTI")
-        except Exception as e:
-            shp_zip = b""
-            st.error(f"Shapefile export error: {e}")
-    _shp_data = _as_bytes(shp_zip)
-    st.download_button(
-        label="Download Shapefile (.zip)",
-        data=_shp_data,
-        file_name="parcels_shapefile.zip",
-        mime="application/zip",
-        type="secondary",
-        use_container_width=True,
-        disabled=not bool(_shp_data),
-    )
+        mime, kmz_data = features_to_kml_kmz(fc_all, as_kmz=True)
+        st.download_button("⬇️ KMZ", data=kmz_data, file_name="parcels.kmz", mime="application/vnd.google-earth.kmz")
+    else:
+        st.caption(" ")
