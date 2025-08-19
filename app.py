@@ -16,6 +16,7 @@ import concurrent.futures
 import requests
 import streamlit as st
 import pydeck as pdk
+import NSW_query
 
 # Optional KML export
 try:
@@ -140,12 +141,6 @@ RE_VERBOSE = re.compile(
 RE_SA_PLANPARCEL = re.compile(r"^\s*(?P<planparcel>[A-Za-z]{1,2}\d+[A-Za-z]{1,2}\d+)\s*$")
 RE_SA_TITLEPAIR  = re.compile(r"^\s*(?P<a>\d{1,6})\s*/\s*(?P<b>\d{1,6})\s*$")
 
-def _nsw_normalize_lotid(raw: str) -> str:
-    s = (raw or "").strip().upper().replace(" ", "")
-    if "//" in s: return s
-    m = RE_NSW_ONE_SLASH.match(s)
-    return f"{m.group('lot')}//{m.group('plan')}" if m else s
-
 def _qld_normalize_lotplan(raw: str) -> Optional[str]:
     """
     Normalize user input to a single QLD LOTPLAN token like '13SP181800'.
@@ -194,7 +189,7 @@ def parse_queries(multiline: str) -> List[Dict]:
         # NSW first
         m = RE_NSW_LOTID.match(raw) or RE_NSW_ONE_SLASH.match(raw)
         if m:
-            items.append({"raw": raw, "nsw_lotid": _nsw_normalize_lotid(raw)})
+            items.append({"raw": raw, "nsw_lotid": raw})
             continue
         # QLD various forms captured for legacy per-line mode
         m = RE_LOTPLAN_SLASH.match(raw)
@@ -276,43 +271,6 @@ def fetch_sa_by_title(volume: str, folio: str) -> Dict:
     url = ENDPOINTS["SA"]
     where = f"(volume='{volume}') AND (folio='{folio}')"
     return _arcgis_query(url, where)
-
-# NSW one-shot & bulk by lotidstring
-def nsw_fetch_one(lotid: str) -> Dict:
-    url = ENDPOINTS["NSW"]
-    lotid_norm = _nsw_normalize_lotid(lotid)
-    params = {"where": f"lotidstring='{lotid_norm}'", "outFields": "*"}
-    data = _http_get_json(url, params, timeout=REQUEST_TIMEOUT, retries=REQUEST_RETRIES)
-    return _arcgis_to_fc(data)
-
-def nsw_fetch_bulk(lotids: List[str], max_workers: int = MAX_WORKERS_NSW) -> Dict:
-    lotids_norm = [ _nsw_normalize_lotid(x) for x in lotids if x and x.strip() ]
-    if not lotids_norm:
-        return {"type":"FeatureCollection","features":[]}
-    features: List[Dict] = []
-    errors: List[str] = []
-    def _task(lid: str):
-        try:
-            return lid, nsw_fetch_one(lid)
-        except Exception as e:
-            return lid, {"error": str(e)}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for lid, res in ex.map(_task, lotids_norm):
-            if "error" in res:
-                errors.append(f"{lid}: {res['error']}")
-            else:
-                features.extend(res.get("features", []))
-    if errors:
-        st.warning("NSW bulk had issues:\n- " + "\n- ".join(errors[:10]), icon="⚠️")
-        if len(errors) > 10: st.caption(f"... plus {len(errors) - 10} more.")
-    # de-dup
-    seen=set(); uniq=[]
-    for f in features:
-        props=f.get("properties") or {}
-        sig=(props.get("objectid"), props.get("lotidstring"))
-        if sig not in seen:
-            seen.add(sig); uniq.append(f)
-    return {"type":"FeatureCollection","features":uniq}
 
 # ------------- NEW: QLD bulk by LOTPLAN (lot+plan as one token) -------------
 
@@ -526,7 +484,7 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 raw_items = [x.strip() for part in nsw_bulk_text.splitlines() for x in part.split(",")]
                 lotids = [x for x in raw_items if x]
                 st.caption(f"NSW bulk: {len(lotids)} lotidstring(s)")
-                fc_bulk = nsw_fetch_bulk(lotids)
+                fc_bulk = NSW_query.nsw_fetch_bulk(lotids)
                 c = len(fc_bulk.get("features", [])); state_counts["NSW"] += c
                 if c == 0: st.warning("NSW bulk: no parcels found.", icon="⚠️")
                 else: st.success(f"NSW bulk: found {c} feature(s).")
@@ -535,10 +493,10 @@ if run_btn and (sel_qld or sel_nsw or sel_sa):
                 for p in parsed:
                     if p.get("unparsed"): continue
                     if "nsw_lotid" in p:
-                        lotid = _nsw_normalize_lotid(p["nsw_lotid"])
-                        st.caption(f"NSW where: lotidstring='{lotid}'")
+                        lotid = p["nsw_lotid"]
+                        st.caption(f"NSW where: lotidstring='{NSW_query._nsw_normalize_lotid(lotid)}'")
                         try:
-                            fc = nsw_fetch_one(lotid)
+                            fc = NSW_query.nsw_fetch_one(lotid)
                         except requests.exceptions.Timeout:
                             state_warnings.append("NSW request timed out.")
                             fc = {"type":"FeatureCollection","features":[]}
