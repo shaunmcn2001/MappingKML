@@ -669,17 +669,26 @@ with d1:
     )
 
 with d2:
-    kml_bytes = None
+    kml_bytes = b""
     if HAVE_SIMPLEKML and accum_features:
-        _, kml_bytes = features_to_kml_kmz(fc_all, as_kmz=False)
+        try:
+            _, kml_bytes = features_to_kml_kmz(fc_all, as_kmz=False)
+        except Exception as e:
+            kml_bytes = b""
+            st.error(f"KML export error: {e}")
+    # Normalize to raw bytes for Streamlit (avoid dict/obj -> RuntimeError)
+    _kml_data = (
+        kml_bytes.getvalue() if hasattr(kml_bytes, "getvalue")
+        else (bytes(kml_bytes) if isinstance(kml_bytes, (bytes, bytearray)) else b"")
+    )
     st.download_button(
         label="Download KML",
-        data=kml_bytes,
+        data=_kml_data,
         file_name="parcels.kml",
         mime="application/vnd.google-earth.kml+xml",
         type="primary",
         use_container_width=True,
-        disabled=not bool(kml_bytes),
+        disabled=not bool(_kml_data),
     )
     if not HAVE_SIMPLEKML:
         st.caption("Install `simplekml` for KML/KMZ: pip install simplekml")
@@ -699,18 +708,24 @@ with d3:
     )
 
 with d4:
-    shp_zip = None
+    shp_zip = b""
     if accum_features:
         try:
             shp_zip = generate_shapefile(accum_features, "MULTI")
-        except Exception:
-            shp_zip = None
+        except Exception as e:
+            shp_zip = b""
+            st.error(f"Shapefile export error: {e}")
+    # Normalize to raw bytes for Streamlit
+    _shp_data = (
+        shp_zip.getvalue() if hasattr(shp_zip, "getvalue")
+        else (bytes(shp_zip) if isinstance(shp_zip, (bytes, bytearray)) else b"")
+    )
     st.download_button(
         label="Download Shapefile (.zip)",
-        data=shp_zip,
+        data=_shp_data,
         file_name="parcels_shapefile.zip",
         mime="application/zip",
         type="secondary",
         use_container_width=True,
-        disabled=not bool(shp_zip),
+        disabled=not bool(_shp_data),
     )
